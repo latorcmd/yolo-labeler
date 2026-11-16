@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.qa/
+*.ylproject
+*.ylproject.bak
+*.zip
+*.report.json
+class-ranges.csv
