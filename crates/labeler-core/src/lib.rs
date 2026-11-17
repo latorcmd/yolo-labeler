@@ -20,6 +20,22 @@ pub type Progress<'a> = &'a mut dyn FnMut(usize, usize);
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum DecisionOrigin {
+    #[default]
+    AutoDefault,
+    Manual,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ImportOptions {
+    pub background: bool,
+    pub fixed_class: usize,
+    pub ranges: Option<PathBuf>,
+    pub detector: DetectorConfig,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Decision {
     #[default]
     Pending,
@@ -35,7 +51,7 @@ impl Decision {
             Self::Keep => "採用",
             Self::Exclude => "除外",
             Self::Hold => "保留",
-            Self::Fix => "要修正",
+            Self::Fix => "要確認",
         }
     }
 }
@@ -52,6 +68,12 @@ pub struct Sample {
     pub height: u32,
     pub boxes: Vec<NormalizedBox>,
     pub has_label: bool,
+    #[serde(default)]
+    pub background: bool,
+    #[serde(default)]
+    pub decision_origin: DecisionOrigin,
+    #[serde(default)]
+    pub automatic_label: bool,
     pub label_errors: Vec<String>,
     pub image_error: Option<String>,
     pub decision: Decision,
@@ -67,14 +89,15 @@ pub struct Sample {
 impl Sample {
     pub fn approvable(&self) -> bool {
         self.has_label
-            && !self.boxes.is_empty()
+            && ((!self.boxes.is_empty() && !self.background)
+                || (self.boxes.is_empty() && self.background))
             && self.label_errors.is_empty()
             && self.image_error.is_none()
             && !self.proposal_pending
             && self.proposals.is_empty()
     }
     pub fn protected(&self) -> bool {
-        self.reviewed || matches!(self.decision, Decision::Keep | Decision::Exclude)
+        self.reviewed || self.decision_origin == DecisionOrigin::Manual
     }
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -98,6 +121,8 @@ pub struct Project {
     pub version: u32,
     pub id: Uuid,
     pub classes: Vec<String>,
+    #[serde(default)]
+    pub class_display_names: Vec<String>,
     pub samples: Vec<Sample>,
     pub view: ViewState,
     pub audit: Vec<Audit>,
@@ -244,8 +269,50 @@ pub fn image_files(root: &Path) -> Vec<PathBuf> {
         .filter(|e| e.file_type().is_file() && is_image(e.path()))
         .map(|e| e.into_path())
         .collect::<Vec<_>>();
-    files.sort_by_key(|p| p.to_string_lossy().to_lowercase());
+    files.sort_by(|a, b| natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
     files
+}
+/// Case-insensitive natural order without parsing numeric runs into a fixed-size integer.
+pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let lower_a = a.to_lowercase();
+    let lower_b = b.to_lowercase();
+    let (a, b) = (lower_a.as_bytes(), lower_b.as_bytes());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i].is_ascii_digit() && b[j].is_ascii_digit() {
+            let (start_i, start_j) = (i, j);
+            while i < a.len() && a[i].is_ascii_digit() {
+                i += 1;
+            }
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            let mut significant_i = start_i;
+            let mut significant_j = start_j;
+            while significant_i + 1 < i && a[significant_i] == b'0' {
+                significant_i += 1;
+            }
+            while significant_j + 1 < j && b[significant_j] == b'0' {
+                significant_j += 1;
+            }
+            let order = (i - significant_i)
+                .cmp(&(j - significant_j))
+                .then_with(|| a[significant_i..i].cmp(&b[significant_j..j]))
+                .then_with(|| (i - start_i).cmp(&(j - start_j)));
+            if order != Ordering::Equal {
+                return order;
+            }
+        } else {
+            let order = a[i].cmp(&b[j]);
+            if order != Ordering::Equal {
+                return order;
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 pub fn is_image(p: &Path) -> bool {
     p.extension()
@@ -317,9 +384,10 @@ impl Project {
         let file = std::path::absolute(file)?;
         Ok(Self {
             format: "yolo-labeler-rust".into(),
-            version: 1,
+            version: 2,
             id: Uuid::new_v4(),
             classes,
+            class_display_names: vec![],
             samples: vec![],
             view: ViewState::default(),
             audit: vec![],
@@ -333,6 +401,64 @@ impl Project {
     pub fn assets(&self) -> PathBuf {
         self.file.with_extension("ylp2.assets")
     }
+    /// Clone persistent state for the writer without copying the 40-operation Undo history.
+    pub fn save_snapshot(&self) -> Self {
+        Self {
+            format: self.format.clone(),
+            version: self.version,
+            id: self.id,
+            classes: self.classes.clone(),
+            class_display_names: self.class_display_names.clone(),
+            samples: self.samples.clone(),
+            view: self.view.clone(),
+            audit: self.audit.clone(),
+            warnings: self.warnings.clone(),
+            file: self.file.clone(),
+            undo: VecDeque::new(),
+            revision: self.revision,
+            needs_save: self.needs_save,
+        }
+    }
+    pub fn preflight_background_conflicts(
+        &self,
+        root: &Path,
+        paths: &[PathBuf],
+        labels: Option<&Path>,
+    ) -> Result<Vec<PathBuf>> {
+        let root = fs::canonicalize(root)?;
+        let root = root
+            .ancestors()
+            .find(|p| p.file_name().is_some_and(|s| s == "images"))
+            .and_then(Path::parent)
+            .unwrap_or(&root);
+        let mut conflicts = vec![];
+        for path in paths {
+            ensure!(
+                !path.is_symlink() && is_image(path),
+                "対応する画像ではありません: {}",
+                path.display()
+            );
+            let original = fs::canonicalize(path)?;
+            ensure!(original.starts_with(root), "追加元フォルダー外の画像です");
+            if self
+                .samples
+                .iter()
+                .any(|s| s.origin_root.join(&s.origin_relative) == original)
+            {
+                continue;
+            }
+            let rel = original.strip_prefix(root)?;
+            if let Some(label) = label_path(root, rel, labels) {
+                if let Ok(text) = fs::read_to_string(label) {
+                    let (boxes, errors) = parse_yolo(&text, self.classes.len());
+                    if !boxes.is_empty() && errors.is_empty() {
+                        conflicts.push(rel.to_path_buf());
+                    }
+                }
+            }
+        }
+        Ok(conflicts)
+    }
     pub fn image_path(&self, s: &Sample) -> Result<PathBuf> {
         safe_join(&self.assets(), &s.path)
     }
@@ -343,7 +469,7 @@ impl Project {
         );
         let mut p: Self = serde_json::from_slice(&fs::read(file)?)?;
         ensure!(
-            p.format == "yolo-labeler-rust" && p.version == 1,
+            p.format == "yolo-labeler-rust" && matches!(p.version, 1 | 2),
             "非対応のプロジェクト形式です"
         );
         validate_classes(&p.classes)?;
@@ -358,7 +484,51 @@ impl Project {
             }
         }
         p.recover_imports()?;
+        if p.version == 1 {
+            for s in &mut p.samples {
+                s.background = s.has_label && s.boxes.is_empty() && s.label_errors.is_empty();
+                if s.decision == Decision::Pending && !s.reviewed {
+                    s.decision = if s.approvable() {
+                        Decision::Keep
+                    } else {
+                        Decision::Fix
+                    };
+                    s.decision_origin = DecisionOrigin::AutoDefault;
+                } else {
+                    s.decision_origin = DecisionOrigin::Manual;
+                }
+            }
+            p.version = 2;
+            p.needs_save = true;
+        }
         Ok(p)
+    }
+    pub fn display_class(&self, id: usize) -> String {
+        let Some(original) = self.classes.get(id) else {
+            return format!("#{id}");
+        };
+        match self
+            .class_display_names
+            .get(id)
+            .map(String::as_str)
+            .filter(|s| !s.is_empty() && *s != original)
+        {
+            Some(display) => format!("{display} ({original})"),
+            None => original.clone(),
+        }
+    }
+    pub fn set_display_names(&mut self, names: Vec<String>) -> Result<()> {
+        ensure!(
+            names.len() <= self.classes.len(),
+            "表示名の数がクラス数を超えています"
+        );
+        ensure!(
+            names.iter().all(|n| !n.contains(['\r', '\n'])),
+            "表示名は1行で指定してください"
+        );
+        self.class_display_names = names.into_iter().map(|n| n.trim().to_owned()).collect();
+        self.log("ラベル表示名変更", vec![]);
+        Ok(())
     }
     pub fn save(&self) -> Result<()> {
         validate_classes(&self.classes)?;
@@ -421,6 +591,28 @@ impl Project {
         cancel: &AtomicBool,
         progress: Progress<'_>,
     ) -> Result<usize> {
+        self.import_internal(root, paths, labels, None, cancel, progress)
+    }
+    pub fn import_with_options(
+        &mut self,
+        root: &Path,
+        paths: &[PathBuf],
+        labels: Option<&Path>,
+        options: &ImportOptions,
+        cancel: &AtomicBool,
+        progress: Progress<'_>,
+    ) -> Result<usize> {
+        self.import_internal(root, paths, labels, Some(options), cancel, progress)
+    }
+    fn import_internal(
+        &mut self,
+        root: &Path,
+        paths: &[PathBuf],
+        labels: Option<&Path>,
+        options: Option<&ImportOptions>,
+        cancel: &AtomicBool,
+        progress: Progress<'_>,
+    ) -> Result<usize> {
         let root = fs::canonicalize(root)?;
         let root = root
             .ancestors()
@@ -433,6 +625,53 @@ impl Project {
             classes.is_empty() || classes == self.classes,
             "追加元の classes.txt の順序・名称が一致しません"
         );
+        let ranges = if let Some(options) = options.filter(|o| !o.background) {
+            ensure!(
+                options.fixed_class < self.classes.len(),
+                "クラスIDが範囲外です"
+            );
+            options
+                .ranges
+                .as_ref()
+                .map(|p| read_ranges(p, self.classes.len()))
+                .transpose()?
+        } else {
+            None
+        };
+        if options.is_some_and(|o| o.background) {
+            let mut conflicts = vec![];
+            for path in paths {
+                cancelled(cancel)?;
+                ensure!(
+                    !path.is_symlink() && is_image(path),
+                    "対応する画像ではありません: {}",
+                    path.display()
+                );
+                let original = fs::canonicalize(path)?;
+                ensure!(original.starts_with(&root), "追加元フォルダー外の画像です");
+                if self
+                    .samples
+                    .iter()
+                    .any(|s| s.origin_root.join(&s.origin_relative) == original)
+                {
+                    continue;
+                }
+                let rel = original.strip_prefix(&root)?;
+                if let Some(label) = label_path(&root, rel, labels) {
+                    if let Ok(text) = fs::read_to_string(label) {
+                        let (boxes, errors) = parse_yolo(&text, self.classes.len());
+                        if !boxes.is_empty() && errors.is_empty() {
+                            conflicts.push(rel.display().to_string());
+                        }
+                    }
+                }
+            }
+            ensure!(
+                conflicts.is_empty(),
+                "対象なしの指定と既存の対象枠が矛盾しています。対象ありへ変更するか、追加を中止してください:\n{}",
+                conflicts.join("\n")
+            );
+        }
         if !self.file.exists() {
             self.save()?;
         }
@@ -473,8 +712,8 @@ impl Project {
                 Err(e) => (0, 0, Some(e.to_string())),
             };
             let label = label_path(&root, &rel, labels);
-            let has_label = label.is_some();
-            let (boxes, label_errors) = if let Some(l) = label {
+            let mut has_label = label.is_some();
+            let (mut boxes, mut label_errors) = if let Some(l) = label {
                 fs::copy(&l, target.with_extension("txt"))?;
                 match fs::read_to_string(l) {
                     Ok(t) => parse_yolo(&t, self.classes.len()),
@@ -482,6 +721,54 @@ impl Project {
                 }
             } else {
                 (vec![], vec![])
+            };
+            let mut background = has_label && boxes.is_empty() && label_errors.is_empty();
+            let mut automatic_label = false;
+            if let Some(options) = options {
+                if image_error.is_none() {
+                    if options.background {
+                        boxes.clear();
+                        label_errors.clear();
+                        has_label = true;
+                        background = true;
+                        fs::write(target.with_extension("txt"), "")?;
+                    } else if boxes.is_empty() && label_errors.is_empty() {
+                        background = false;
+                        let class = if let Some(ranges) = &ranges {
+                            class_from_ranges(&rel, ranges)?
+                        } else {
+                            options.fixed_class
+                        };
+                        let detected = image::load_from_memory(&payload)
+                            .map_err(anyhow::Error::from)
+                            .and_then(|im| labeler_vision::detect(&im, &options.detector));
+                        cancelled(cancel)?;
+                        match detected {
+                            Ok(mut detection) if !detection.boxes.is_empty() => {
+                                for b in &mut detection.boxes {
+                                    b.class_id = class;
+                                }
+                                boxes = detection.boxes;
+                                has_label = true;
+                                automatic_label = true;
+                                fs::write(target.with_extension("txt"), yolo_text(&boxes))?;
+                            }
+                            Ok(_) => label_errors.push(
+                                "対象の枠を検出できませんでした。枠を編集してください".into(),
+                            ),
+                            Err(error) => label_errors.push(format!("自動ラベリング失敗: {error}")),
+                        }
+                    }
+                }
+            }
+            let decision = if has_label
+                && (!boxes.is_empty() || background)
+                && label_errors.is_empty()
+                && image_error.is_none()
+            {
+                Decision::Keep
+            } else {
+                Decision::Fix
             };
             added.push(Sample {
                 id,
@@ -494,9 +781,12 @@ impl Project {
                 height,
                 boxes,
                 has_label,
+                background,
+                decision_origin: DecisionOrigin::AutoDefault,
+                automatic_label,
                 label_errors,
                 image_error,
-                decision: Decision::Pending,
+                decision,
                 reviewed: false,
                 reason: String::new(),
                 proposals: vec![],
@@ -574,6 +864,7 @@ impl Project {
         self.checkpoint(ids);
         for s in &mut self.samples {
             if ids.contains(&s.id) {
+                s.decision_origin = DecisionOrigin::Manual;
                 if decision == Decision::Keep && !s.approvable() {
                     s.decision = Decision::Fix;
                 } else {
@@ -593,6 +884,7 @@ impl Project {
             if !ids.contains(&s.id) {
                 continue;
             }
+            s.decision_origin = DecisionOrigin::Manual;
             if excluded.contains(&s.id) {
                 s.decision = Decision::Exclude;
             } else if matches!(s.decision, Decision::Pending | Decision::Keep) {
@@ -628,6 +920,9 @@ impl Project {
             .context("画像がありません")?;
         s.boxes = boxes;
         s.has_label = true;
+        s.background = s.boxes.is_empty() && negative;
+        s.automatic_label = false;
+        s.decision_origin = DecisionOrigin::Manual;
         s.label_errors.clear();
         s.proposals.clear();
         s.proposal_pending = false;
@@ -690,6 +985,7 @@ impl Project {
             let s = self.samples.iter_mut().find(|s| s.id == id).unwrap();
             s.proposals = b;
             s.proposal_pending = true;
+            s.decision = Decision::Fix;
             s.proposal_info = serde_json::json!({"backend":"external-yolo"});
         }
         self.log("外部候補", ids.clone());
@@ -746,6 +1042,7 @@ impl Project {
             let s = self.samples.iter_mut().find(|s| s.id == id).unwrap();
             s.proposals = d.boxes;
             s.proposal_pending = true;
+            s.decision = Decision::Fix;
             s.proposal_info = serde_json::json!({"backend":"rust-imageproc-v1","method":d.method,"threshold":d.threshold,"component_count":d.component_count,"flags":d.flags,"config":config});
         }
         self.log("候補生成", ids.clone());
@@ -799,7 +1096,7 @@ impl Project {
                     .map(|b| yolo_text(std::slice::from_ref(b)))
                     .collect::<Vec<_>>();
                 v.sort();
-                v
+                (s.background, v)
             };
             let base = signature(&self.samples[rep]);
             let conflict = indices.iter().any(|&i| {
@@ -854,6 +1151,7 @@ impl Project {
                     return false;
                 };
                 !s.duplicate_conflict
+                    && s.background == rep.background
                     && s.has_label
                     && s.proposals.is_empty()
                     && rep.has_label
@@ -894,6 +1192,14 @@ impl Project {
     }
     pub fn validate_export(&self) -> Vec<String> {
         let mut errors = vec![];
+        for sample in &self.samples {
+            if matches!(sample.decision, Decision::Pending | Decision::Fix) {
+                errors.push(format!(
+                    "要確認の画像が残っています: {}",
+                    sample.origin_relative.display()
+                ));
+            }
+        }
         if let Err(e) = validate_classes(&self.classes) {
             errors.push(e.to_string());
         }
@@ -910,9 +1216,9 @@ impl Project {
         }
         let mut counts = vec![0; self.classes.len()];
         for s in accepted {
-            if !s.reviewed || !s.approvable() {
+            if !s.approvable() {
                 errors.push(format!(
-                    "未承認・ラベル不正・枠なし: {}",
+                    "未承認・ラベル不正・背景未指定: {}",
                     s.origin_relative.display()
                 ));
             }
@@ -1039,6 +1345,8 @@ pub fn inspect_zip(path: &Path) -> Result<serde_json::Value> {
         .collect::<Vec<_>>();
     ensure!(images.len() >= MIN_IMAGES, "画像は101枚以上必要です");
     let mut allowed = HashSet::from(["classes.txt".to_owned(), "v-training.config".to_owned()]);
+    let mut counts = vec![0usize; classes.len()];
+    let mut backgrounds = 0usize;
     for name in &images {
         let mut bytes = vec![];
         zip.by_name(name)?.read_to_end(&mut bytes)?;
@@ -1057,14 +1365,24 @@ pub fn inspect_zip(path: &Path) -> Result<serde_json::Value> {
             .into_owned();
         let mut t = String::new();
         zip.by_name(&label)?.read_to_string(&mut t)?;
-        let (b, e) = parse_yolo(&t, classes.len());
-        ensure!(e.is_empty() && !b.is_empty(), "ラベルが不正です: {label}");
+        let (boxes, e) = parse_yolo(&t, classes.len());
+        ensure!(e.is_empty(), "ラベルが不正です: {label}");
+        if boxes.is_empty() {
+            backgrounds += 1;
+        }
+        for b in boxes {
+            counts[b.class_id] += 1;
+        }
         allowed.insert(name.clone());
         allowed.insert(label);
     }
     ensure!(names == allowed, "ZIPに想定外のファイルがあります");
+    ensure!(
+        counts.iter().all(|n| *n > 0),
+        "採用枠が0個のクラスがあります"
+    );
     Ok(
-        serde_json::json!({"images":images.len(),"classes":classes,"bytes":fs::metadata(path)?.len()}),
+        serde_json::json!({"images":images.len(),"backgrounds":backgrounds,"classes":classes,"bytes":fs::metadata(path)?.len()}),
     )
 }
 #[derive(Clone, Debug, Deserialize)]

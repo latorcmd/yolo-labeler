@@ -8,6 +8,7 @@ struct Snapshot {
     proposals: Vec<NormalizedBox>,
     resolved: bool,
     selected: Option<usize>,
+    negative: bool,
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -35,6 +36,7 @@ pub struct Edit {
     selected: Option<usize>,
     class: usize,
     mode: Mode,
+    canvas_size: (f64, f64),
     zoom: f64,
     pan: (f64, f64),
     history: VecDeque<Snapshot>,
@@ -47,13 +49,14 @@ impl Edit {
             boxes: s.boxes.clone(),
             proposals: s.proposals.clone(),
             resolved: !s.proposal_pending && s.proposals.is_empty(),
-            negative: s.has_label && s.boxes.is_empty(),
+            negative: s.background,
             sample: s,
             classes,
             bitmap: None,
             selected: None,
             class: 0,
             mode: Mode::Select,
+            canvas_size: (W, H),
             zoom: 1.,
             pan: (0., 0.),
             history: VecDeque::new(),
@@ -67,6 +70,7 @@ impl Edit {
             proposals: self.proposals.clone(),
             resolved: self.resolved,
             selected: self.selected,
+            negative: self.negative,
         }
     }
     fn restore(&mut self, s: Snapshot) {
@@ -74,6 +78,7 @@ impl Edit {
         self.proposals = s.proposals;
         self.resolved = s.resolved;
         self.selected = s.selected;
+        self.negative = s.negative;
     }
     fn checkpoint(&mut self) {
         self.history.push_back(self.snapshot());
@@ -89,11 +94,17 @@ impl Edit {
         }
     }
     fn transform(&self) -> (f64, f64, f64, f64) {
-        let scale = (W / self.sample.width.max(1) as f64).min(H / self.sample.height.max(1) as f64)
+        let scale = (self.canvas_size.0 / self.sample.width.max(1) as f64)
+            .min(self.canvas_size.1 / self.sample.height.max(1) as f64)
             * self.zoom;
         let w = self.sample.width as f64 * scale;
         let h = self.sample.height as f64 * scale;
-        ((W - w) / 2. + self.pan.0, (H - h) / 2. + self.pan.1, w, h)
+        (
+            (self.canvas_size.0 - w) / 2. + self.pan.0,
+            (self.canvas_size.1 - h) / 2. + self.pan.1,
+            w,
+            h,
+        )
     }
     fn point(&self, x: f64, y: f64) -> (f64, f64) {
         let (l, t, w, h) = self.transform();
@@ -157,6 +168,7 @@ impl Edit {
                 d.start.1.max(p.1),
             );
             self.boxes = d.before.boxes.clone();
+            self.negative = false;
             self.boxes.push(NormalizedBox {
                 class_id: self.class,
                 cx: (l + r) / 2.,
@@ -214,7 +226,16 @@ impl Edit {
         }
     }
 }
-fn outline(b: &NormalizedBox, l: f64, t: f64, w: f64, h: f64, color: Color, selected: bool) -> Div {
+fn outline(
+    b: &NormalizedBox,
+    label: String,
+    l: f64,
+    t: f64,
+    w: f64,
+    h: f64,
+    color: Color,
+    selected: bool,
+) -> Div {
     let x = l + (b.cx - b.width / 2.) * w;
     let y = t + (b.cy - b.height / 2.) * h;
     let bw = b.width * w;
@@ -239,7 +260,7 @@ fn outline(b: &NormalizedBox, l: f64, t: f64, w: f64, h: f64, color: Color, sele
                 .border_color(color),
         )
         .child(
-            text(format!("{}", b.class_id))
+            text(label)
                 .bg(Color::BLACK)
                 .text_color(Color::WHITE)
                 .text_size(12_f32),
@@ -269,6 +290,17 @@ pub fn preview(
     proposals: Vec<NormalizedBox>,
     crop: bool,
 ) -> Div {
+    preview_sized(bmp, boxes, width, height, proposals, crop, 160.)
+}
+pub fn preview_sized(
+    bmp: Option<Arc<Bitmap>>,
+    boxes: Vec<NormalizedBox>,
+    width: u32,
+    height: u32,
+    proposals: Vec<NormalizedBox>,
+    crop: bool,
+    thumbnail_height: f32,
+) -> Div {
     // Thumbnail pixels are raw, unrotated RGB(A); framework file decoders can apply EXIF.
     let zoom_box = if crop { boxes.first().cloned() } else { None };
     let (l, t, w, h) = if let Some(b) = zoom_box {
@@ -280,7 +312,7 @@ pub fn preview(
     let ratio = width.max(1) as f32 / height.max(1) as f32;
     let picture = div()
         .relative()
-        .w((160_f32 * ratio).min(240.))
+        .w((thumbnail_height * ratio).min(240.))
         .max_w(pct(100.))
         .aspect_ratio(ratio)
         .overflow_clip()
@@ -309,7 +341,7 @@ pub fn preview(
         .items_center()
         .justify_center()
         .w_full()
-        .h(160.)
+        .h(thumbnail_height)
         .bg(rgb(0x111722))
         .pointer_events_none()
         .child(picture)
@@ -358,7 +390,6 @@ pub fn view(c: Controller) -> Div {
     let title = e.sample.origin_relative.display().to_string();
     let classes = e.classes.clone();
     let class = signal(e.class);
-    let negative = signal(e.negative);
     let ec = c.clone();
     effect(move || {
         let v = class.get();
@@ -372,11 +403,6 @@ pub fn view(c: Controller) -> Div {
             }
         })
     });
-    let nc = c.clone();
-    effect(move || {
-        let v = negative.get();
-        update(&nc, |e| e.negative = v)
-    });
     let bmc = c.clone();
     let style_c = c.clone();
     let overlays = c.clone();
@@ -385,10 +411,18 @@ pub fn view(c: Controller) -> Div {
     let keys = c.clone();
     let c_info = c.clone();
     let cancelled = c.clone();
+    let background_label = c.clone();
+    let background_action = c.clone();
+    let canvas_viewport = c.viewport;
+    let canvas_resize = c.clone();
     let canvas = div()
         .relative()
-        .w(W as f32)
-        .h(H as f32)
+        .dyn_style(move |s| {
+            let (w, h) = canvas_viewport.get();
+            s.w((w - 270.).clamp(300., 900.))
+                .h((h - 200.).clamp(160., 520.))
+        })
+        .on_resized(move |w, h| update(&canvas_resize, |e| e.canvas_size = (w as f64, h as f64)))
         .overflow_hidden()
         .bg(rgb(0x111722))
         .focusable()
@@ -420,17 +454,30 @@ pub fn view(c: Controller) -> Div {
                 .w_full()
                 .h_full()
                 .pointer_events_none()
-                .children(
-                    e.boxes
-                        .iter()
-                        .enumerate()
-                        .map(|(i, b)| outline(b, l, t, w, h, rgb(0x64e1ba), e.selected == Some(i))),
-                )
-                .children(
-                    e.proposals
-                        .iter()
-                        .map(|b| outline(b, l, t, w, h, rgb(0xffc857), false)),
-                )
+                .children(e.boxes.iter().enumerate().map(|(i, b)| {
+                    outline(
+                        b,
+                        e.classes[b.class_id].clone(),
+                        l,
+                        t,
+                        w,
+                        h,
+                        rgb(0x64e1ba),
+                        e.selected == Some(i),
+                    )
+                }))
+                .children(e.proposals.iter().map(|b| {
+                    outline(
+                        b,
+                        e.classes[b.class_id].clone(),
+                        l,
+                        t,
+                        w,
+                        h,
+                        rgb(0xffc857),
+                        false,
+                    )
+                }))
         }))
         .grab_threshold(0.)
         .on_grab(move |event| {
@@ -451,24 +498,8 @@ pub fn view(c: Controller) -> Div {
             });
         })
         .on_key_down(move |event| {
+            shortcut(&keys, event);
             event.stop_propagation();
-            if event.key.is_char('w') {
-                update(&keys, |e| e.mode = Mode::Draw)
-            } else if event.key.is_char('v') {
-                update(&keys, |e| e.mode = Mode::Select)
-            } else if event.key.is_char('p') {
-                update(&keys, |e| e.mode = Mode::Pan)
-            } else if event.modifiers.ctrl && event.key.is_char('z') {
-                update(&keys, Edit::undo)
-            } else if event.key == Key::Named(NamedKey::Delete) {
-                update(&keys, |e| {
-                    if let Some(i) = e.selected {
-                        e.checkpoint();
-                        e.boxes.remove(i);
-                        e.selected = None;
-                    }
-                })
-            }
         });
     let list_c = c.clone();
     let buttons = vec![
@@ -493,14 +524,18 @@ pub fn view(c: Controller) -> Div {
         }),
     ];
     div().flex().flex_col().gap(10_f32).p(12_f32).border(1_f32).dyn_style(|s|s.bg(theme().surface).border_color(theme().border))
-  .child(heading(title)).child(div().flex().flex_row().gap(6_f32).children(buttons).child(select(class,classes.iter().enumerate().map(|(i,n)|(i,n.clone())).collect())))
+  .child(heading(title)).child(div().flex().flex_row().flex_wrap().gap(6_f32).children(buttons).child(select(class,classes.iter().enumerate().map(|(i,n)|(i,n.clone())).collect()).on_key_down(guard_input)))
   .child(div().flex().flex_row().gap(12_f32).child(canvas).child(div().flex().flex_col().gap(8_f32).w(220.)
    .child(text(move||c_info.edit.with(|e|e.as_ref().map(|e|format!("{}枠 / 候補{}枠\n{}\n{}",e.boxes.len(),e.proposals.len(),if e.resolved{"候補解決済み"}else{"候補の承認・破棄が必要"},e.sample.label_errors.join("\n"))).unwrap_or_default())))
-   .child(action(&c,"候補で枠を置換",|c|update(&c,|e|{e.checkpoint();e.boxes=e.proposals.clone();e.proposals.clear();e.resolved=true;e.selected=None;})))
+   .child(action(&c,"候補で枠を置換",|c|update(&c,|e|{e.checkpoint();e.boxes=e.proposals.clone();e.negative=e.boxes.is_empty();e.proposals.clear();e.resolved=true;e.selected=None;})))
    .child(action(&c,"候補をすべて破棄",|c|update(&c,|e|{e.checkpoint();e.proposals.clear();e.resolved=true;})))
    .child(dyn_view(move||{let Some(e)=list_c.edit.get()else{return div()};let mut list=div().flex().flex_col().gap(4_f32);for(i,b)in e.boxes.iter().enumerate(){let lc=list_c.clone();let value=b.clone();list=list.child(button(format!("{}. {} {:.3}×{:.3}",i+1,e.classes[b.class_id],b.width,b.height)).on_click(move |_|{update(&lc,|e|{e.selected=Some(i);e.class=value.class_id;});class.set(value.class_id);}));}list}))
    .child(text("ホイール: ズーム\nP: パンモード\n四隅をドラッグ: リサイズ\n枠をドラッグ: 移動"))))
-  .child(div().flex().flex_row().gap(8_f32).child(checkbox(negative,"対象がない画像として確認した"))
+  .child(div().flex().flex_row().gap(8_f32).child(button(move||background_label.edit.with(|e|if e.as_ref().is_some_and(|e|e.negative){"背景 ✓（対象なし）"}else{"背景にする（枠なし）"})).on_click(move |_|{
+        let has_boxes=background_action.edit.with(|e|e.as_ref().is_some_and(|e|!e.boxes.is_empty()));
+        if has_boxes&&!confirm("枠を取り除いて背景画像にしますか？Undoで戻せます。"){return;}
+        update(&background_action,|e|{e.checkpoint();e.negative=!e.negative;if e.negative{e.boxes.clear();e.selected=None;}});
+   }))
    .child(action(&c,"保存して採用",|c|finish(c,Decision::Keep))).child(action(&c,"保存して保留",|c|finish(c,Decision::Hold)))
    .child(button("キャンセル").on_click(move |_|{if !cancelled.edit.with(|e|e.as_ref().is_some_and(|e|e.dirty))||confirm("編集内容を破棄して閉じる？"){batch(||{cancelled.edit.set(None);cancelled.editing.set(false);});}})))
 }
@@ -545,10 +580,10 @@ pub fn new_dataset_dialog(c: Controller, file: PathBuf, root: PathBuf, labels: O
                         message(e.to_string());
                         return;
                     }
-                    start.job(Job::New(
-                        file.clone(),
-                        classes,
+                    start.events.send(Event::Intake(
+                        Some((file.clone(), classes)),
                         root.clone(),
+                        vec![],
                         labels.clone(),
                     ));
                     close_window();
@@ -556,6 +591,115 @@ pub fn new_dataset_dialog(c: Controller, file: PathBuf, root: PathBuf, labels: O
         },
     );
 }
+pub fn save_current(c: Controller) {
+    finish(c, Decision::Keep);
+}
+pub fn undo_current(c: &Controller) {
+    update(c, Edit::undo);
+}
+pub fn shortcut(c: &Controller, event: &anti_webui::core::event::KeyboardEvent) {
+    if event.is_default_prevented() {
+        return;
+    }
+    if event.key == Key::Named(NamedKey::F(1)) {
+        help::open();
+    } else if event.key == Key::Named(NamedKey::Escape) {
+        if !c.edit.with(|e| e.as_ref().is_some_and(|e| e.dirty))
+            || confirm("編集を取り消して閉じる？")
+        {
+            batch(|| {
+                c.edit.set(None);
+                c.editing.set(false);
+            });
+        }
+    } else if event.modifiers.ctrl
+        && (event.key == Key::Named(NamedKey::Enter) || event.key.is_char('s'))
+    {
+        finish(c.clone(), Decision::Keep);
+    } else if event.modifiers.ctrl && event.key.is_char('z') {
+        update(c, Edit::undo);
+    } else if event.modifiers.ctrl || event.modifiers.alt || event.modifiers.logo {
+        return;
+    } else if event.key.is_char('w') {
+        update(c, |e| e.mode = Mode::Draw);
+    } else if event.key.is_char('v') {
+        update(c, |e| e.mode = Mode::Select);
+    } else if event.key.is_char('p') {
+        update(c, |e| e.mode = Mode::Pan);
+    } else if event.key == Key::Named(NamedKey::Delete) {
+        update(c, |e| {
+            if let Some(i) = e.selected {
+                e.checkpoint();
+                e.boxes.remove(i);
+                e.selected = None;
+            }
+        });
+    } else {
+        return;
+    }
+    event.prevent_default();
+}
+
+pub fn display_names_dialog(c: Controller) {
+    if !c.project_ready() {
+        return;
+    }
+    let (classes, aliases) = {
+        let state = c.state.borrow();
+        let project = state.project.as_ref().unwrap();
+        (project.classes.clone(), project.class_display_names.clone())
+    };
+    open_window(
+        WindowOptions {
+            title: "ラベル表示名の対応表".into(),
+            width: 700,
+            height: 570,
+            modal: true,
+            dialog: true,
+            ..Default::default()
+        },
+        move || {
+            theme::follow_system();
+            let fields = (0..classes.len())
+                .map(|i| signal(aliases.get(i).cloned().unwrap_or_default()))
+                .collect::<Vec<_>>();
+            let entries = classes
+                .iter()
+                .enumerate()
+                .map(|(id, name)| {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(14_f32)
+                        .items_center()
+                        .child(text(format!("{id}")).w(45.))
+                        .child(text(name.clone()).w(150.))
+                        .child(
+                            text_field(fields[id])
+                                .w(340.)
+                                .placeholder("例: Η / Σ / Υ（空欄は元の名前）")
+                                .on_key_down(|e| e.stop_propagation()),
+                        )
+                })
+                .collect::<Vec<_>>();
+            let save = c.clone();
+            div().flex().flex_col().gap(12_f32).p(24_f32).h_full().overflow_y_scroll()
+            .dyn_style(|s|s.bg(theme().page).text_color(theme().text))
+            .child(heading("表示だけを変更します"))
+            .child(text("ID・保存名・YOLO出力は変わりません。表示名が異なる場合は「表示名 (H)」の形で元名も併記します。"))
+            .child(text("ID          保存名                    表示名"))
+            .children(entries)
+            .child(button("保存").on_click(move |_|{
+                let names=fields.iter().map(|field|field.get()).collect();
+                let result=save.state.borrow_mut().project.as_mut().unwrap().set_display_names(names);
+                match result {Ok(())=>{save.save();save.bump();close_window();},Err(error)=>message(error.to_string())}
+            }))
+            .child(button("キャンセル (Esc)").on_click(|_|close_window()))
+            .on_key_down(|e|{if e.key==Key::Named(NamedKey::Escape){close_window();}e.stop_propagation();})
+        },
+    );
+}
+
 pub fn class_dialog(c: Controller) {
     if !c.project_ready() {
         return;
@@ -650,6 +794,21 @@ mod tests {
         e.undo();
         assert!(!e.resolved);
         assert_eq!(e.proposals.len(), 1);
+    }
+    #[test]
+    fn drawing_on_background_and_undo_restore_the_background_state() {
+        let mut e = edit();
+        e.boxes.clear();
+        e.negative = true;
+        e.mode = Mode::Draw;
+        e.begin(W * 0.25, H * 0.25);
+        e.motion(W * 0.5, H * 0.5, (0., 0.));
+        e.end(false);
+        assert!(!e.negative);
+        assert_eq!(e.boxes.len(), 1);
+        e.undo();
+        assert!(e.negative);
+        assert!(e.boxes.is_empty());
     }
     #[test]
     fn cancelled_drag_restores() {

@@ -160,6 +160,352 @@ fn imports_missing_invalid_empty() {
     assert!(!f.project.samples[1].label_errors.is_empty());
     assert!(f.project.samples[2].has_label);
     assert!(f.project.samples.iter().all(|s| !s.reviewed));
+    assert_eq!(f.project.samples[0].decision, Decision::Fix);
+    assert_eq!(f.project.samples[1].decision, Decision::Fix);
+    assert_eq!(f.project.samples[2].decision, Decision::Keep);
+    assert!(f.project.samples[2].background);
+}
+
+#[test]
+fn natural_order_handles_zero_padding_and_huge_numbers() {
+    let mut names = vec![
+        "100.png",
+        "10.png",
+        "001.png",
+        "2.png",
+        "1.png",
+        "999999999999999999999999999999.png",
+        "1000000000000000000000000000000.png",
+    ];
+    names.sort_by(|a, b| natural_cmp(a, b));
+    assert_eq!(
+        names,
+        vec![
+            "1.png",
+            "001.png",
+            "2.png",
+            "10.png",
+            "100.png",
+            "999999999999999999999999999999.png",
+            "1000000000000000000000000000000.png"
+        ]
+    );
+    assert_eq!(natural_cmp("Α2.JPG", "α2.jpg"), std::cmp::Ordering::Equal);
+}
+
+#[test]
+fn default_keep_is_not_manual_confirmation() {
+    let mut f = Fixture::new();
+    let a = f.image("1.png", Some("0 .5 .5 .3 .4"));
+    f.import(&[a]);
+    let s = &f.project.samples[0];
+    assert_eq!(s.decision, Decision::Keep);
+    assert!(!s.reviewed);
+    assert!(!s.protected());
+    let id = s.id;
+    f.project.decide(&[id], Decision::Exclude);
+    assert!(f.project.samples[0].protected());
+    f.project.undo();
+    assert!(!f.project.samples[0].protected());
+    assert_eq!(f.project.samples[0].decision, Decision::Keep);
+}
+
+#[test]
+fn display_mapping_roundtrip_keeps_class_ids_and_undo() {
+    let mut f = Fixture::populated(1);
+    let id = f.project.samples[0].id;
+    f.project.decide(&[id], Decision::Exclude);
+    f.project.set_display_names(vec!["η".into()]).unwrap();
+    assert_eq!(f.project.display_class(0), "η (H)");
+    assert_eq!(f.project.classes, vec!["H"]);
+    assert_eq!(f.project.samples[0].boxes[0].class_id, 0);
+    assert!(!f.project.undo.is_empty());
+    f.project.save().unwrap();
+    assert_eq!(
+        Project::load(&f.project.file).unwrap().display_class(0),
+        "η (H)"
+    );
+    f.project.set_display_names(vec![" ".into()]).unwrap();
+    assert_eq!(f.project.display_class(0), "H");
+    assert!(
+        f.project
+            .set_display_names(vec!["bad\nname".into()])
+            .is_err()
+    );
+    assert!(
+        f.project
+            .set_display_names(vec!["1".into(), "2".into()])
+            .is_err()
+    );
+    assert!(f.project.save_snapshot().undo.is_empty());
+    assert_eq!(f.project.save_snapshot().samples, f.project.samples);
+}
+
+#[test]
+fn version_one_migrates_pending_and_preserves_manual_states() {
+    let mut f = Fixture::populated(4);
+    f.project.samples[0].decision = Decision::Pending;
+    f.project.samples[0].reviewed = false;
+    f.project.samples[1].decision = Decision::Exclude;
+    f.project.samples[2].decision = Decision::Hold;
+    f.project.samples[3].decision = Decision::Pending;
+    f.project.samples[3].reviewed = false;
+    f.project.samples[3].boxes.clear();
+    let mut json = serde_json::to_value(&f.project).unwrap();
+    json["version"] = 1.into();
+    json.as_object_mut().unwrap().remove("class_display_names");
+    for s in json["samples"].as_array_mut().unwrap() {
+        for field in ["background", "decision_origin", "automatic_label"] {
+            s.as_object_mut().unwrap().remove(field);
+        }
+    }
+    fs::write(&f.project.file, serde_json::to_vec(&json).unwrap()).unwrap();
+    let loaded = Project::load(&f.project.file).unwrap();
+    assert_eq!(loaded.version, 2);
+    assert!(loaded.needs_save);
+    assert_eq!(loaded.samples[0].decision, Decision::Keep);
+    assert!(!loaded.samples[0].protected());
+    assert_eq!(loaded.samples[1].decision, Decision::Exclude);
+    assert!(loaded.samples[1].protected());
+    assert_eq!(loaded.samples[2].decision, Decision::Hold);
+    assert!(loaded.samples[3].background);
+    assert_eq!(loaded.samples[3].decision, Decision::Keep);
+}
+
+#[test]
+fn import_background_conflict_has_no_publication() {
+    let mut f = Fixture::new();
+    let a = f.image("a.png", Some("0 .5 .5 .3 .4"));
+    let options = ImportOptions {
+        background: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        f.project
+            .preflight_background_conflicts(&f.source, &[a.clone()], None)
+            .unwrap(),
+        vec![PathBuf::from("a.png")]
+    );
+    assert!(
+        f.project
+            .import_with_options(&f.source, &[a], None, &options, &flag(), &mut |_, _| {})
+            .is_err()
+    );
+    assert!(f.project.samples.is_empty());
+    assert!(!f.project.assets().join("batches").exists());
+}
+
+#[test]
+fn import_background_missing_txt_and_undo_roundtrip() {
+    let mut f = Fixture::new();
+    let a = f.image("a.png", None);
+    let options = ImportOptions {
+        background: true,
+        ..Default::default()
+    };
+    f.project
+        .import_with_options(
+            &f.source,
+            &[a.clone()],
+            None,
+            &options,
+            &flag(),
+            &mut |_, _| {},
+        )
+        .unwrap();
+    let s = &f.project.samples[0];
+    assert!(s.background && s.has_label && s.approvable());
+    assert_eq!(s.decision, Decision::Keep);
+    assert!(!a.with_extension("txt").exists());
+    assert_eq!(
+        fs::read(f.project.image_path(s).unwrap().with_extension("txt")).unwrap(),
+        b""
+    );
+    let id = s.id;
+    f.project
+        .edit(
+            id,
+            vec![NormalizedBox {
+                class_id: 0,
+                cx: 0.5,
+                cy: 0.5,
+                width: 0.3,
+                height: 0.4,
+            }],
+            Decision::Keep,
+            true,
+            false,
+        )
+        .unwrap();
+    assert!(!f.project.samples[0].background);
+    f.project.undo();
+    assert!(f.project.samples[0].background);
+    f.project.save().unwrap();
+    assert!(Project::load(&f.project.file).unwrap().samples[0].background);
+}
+
+#[test]
+fn import_present_keeps_existing_and_detects_missing_boxes() {
+    let mut f = Fixture::new();
+    let existing = f.image("1.png", Some("0 .5 .5 .2 .2"));
+    let automatic = f.image("2.png", None);
+    let empty = f.image("3.png", Some(""));
+    let invalid = f.image("4.png", Some("bad"));
+    for path in [&automatic, &empty] {
+        let mut im = image::RgbImage::from_pixel(160, 120, image::Rgb([255, 255, 255]));
+        for y in 20..90 {
+            for x in 50..100 {
+                im.put_pixel(x, y, image::Rgb([0, 0, 0]));
+            }
+        }
+        im.save(path).unwrap();
+    }
+    f.project
+        .import_with_options(
+            &f.source,
+            &[existing, automatic, empty, invalid],
+            None,
+            &ImportOptions::default(),
+            &flag(),
+            &mut |_, _| {},
+        )
+        .unwrap();
+    assert_eq!(f.project.samples[0].boxes[0].width, 0.2);
+    assert!(!f.project.samples[0].automatic_label);
+    for s in &f.project.samples[1..3] {
+        assert!(s.automatic_label && s.approvable() && !s.background);
+        assert_eq!(s.decision, Decision::Keep);
+    }
+    assert_eq!(f.project.samples[3].decision, Decision::Fix);
+    assert!(!f.project.samples[3].label_errors.is_empty());
+}
+
+#[test]
+fn failed_detection_stays_fix_and_cancel_does_not_publish() {
+    let mut f = Fixture::new();
+    let a = f.image("1.png", None);
+    f.project
+        .import_with_options(
+            &f.source,
+            &[a],
+            None,
+            &ImportOptions::default(),
+            &flag(),
+            &mut |_, _| {},
+        )
+        .unwrap();
+    assert_eq!(f.project.samples[0].decision, Decision::Fix);
+    assert!(!f.project.samples[0].background);
+    let b = f.image("2.png", None);
+    let stop = flag();
+    let options = ImportOptions {
+        background: true,
+        ..Default::default()
+    };
+    assert!(
+        f.project
+            .import_with_options(&f.source, &[b], None, &options, &stop, &mut |_, _| stop
+                .store(true, Ordering::Relaxed))
+            .is_err()
+    );
+    assert_eq!(f.project.samples.len(), 1);
+}
+
+#[test]
+fn background_zip_has_empty_txt_and_original_class_names() {
+    use std::io::Read;
+    let mut f = Fixture::populated(101);
+    f.project.samples[1].boxes.clear();
+    f.project.samples[1].background = true;
+    f.project.samples[1].reviewed = false;
+    f.project.samples[0].reviewed = false;
+    f.project.set_display_names(vec!["η".into()]).unwrap();
+    let out = f.source.join("background.zip");
+    f.project.export(&out, &flag(), &mut |_, _| {}).unwrap();
+    assert_eq!(inspect_zip(&out).unwrap()["images"], 101);
+    assert_eq!(inspect_zip(&out).unwrap()["backgrounds"], 1);
+    let mut zip = zip::ZipArchive::new(fs::File::open(out).unwrap()).unwrap();
+    let mut label = String::new();
+    zip.by_name("000002.txt")
+        .unwrap()
+        .read_to_string(&mut label)
+        .unwrap();
+    assert!(label.is_empty());
+    let mut classes = String::new();
+    zip.by_name("classes.txt")
+        .unwrap()
+        .read_to_string(&mut classes)
+        .unwrap();
+    assert_eq!(classes, "H\n");
+    for s in &mut f.project.samples {
+        s.boxes.clear();
+        s.background = true;
+    }
+    assert!(
+        f.project
+            .validate_export()
+            .iter()
+            .any(|s| s.contains("採用枠が0個"))
+    );
+}
+
+#[test]
+fn unresolved_images_block_export_until_held_or_excluded() {
+    let mut f = Fixture::populated(101);
+    let missing = f.image("missing.png", None);
+    f.import(&[missing]);
+    let index = f.project.samples.len() - 1;
+    let id = f.project.samples[index].id;
+    assert!(
+        f.project
+            .validate_export()
+            .iter()
+            .any(|s| s.contains("要確認"))
+    );
+    f.project.samples[index].decision = Decision::Pending;
+    assert!(
+        f.project
+            .validate_export()
+            .iter()
+            .any(|s| s.contains("要確認"))
+    );
+    f.project.decide(&[id], Decision::Hold);
+    assert!(f.project.validate_export().is_empty());
+    f.project.decide(&[id], Decision::Exclude);
+    assert!(f.project.validate_export().is_empty());
+}
+
+#[test]
+fn import_csv_assigns_detected_classes_and_manual_edit_clears_auto() {
+    let mut f = Fixture::new();
+    f.project.set_classes(vec!["H".into(), "S".into()]).unwrap();
+    let path = f.image("2.png", None);
+    let mut im = image::RgbImage::from_pixel(160, 120, image::Rgb([255, 255, 255]));
+    for y in 20..90 {
+        for x in 50..100 {
+            im.put_pixel(x, y, image::Rgb([0, 0, 0]));
+        }
+    }
+    im.save(&path).unwrap();
+    let csv = f.source.join("ranges.csv");
+    fs::write(&csv, "start,end,class_id\n1,3,1\n").unwrap();
+    let options = ImportOptions {
+        ranges: Some(csv),
+        ..Default::default()
+    };
+    f.project
+        .import_with_options(&f.source, &[path], None, &options, &flag(), &mut |_, _| {})
+        .unwrap();
+    let s = &f.project.samples[0];
+    assert_eq!(s.boxes[0].class_id, 1);
+    assert!(s.automatic_label);
+    let (id, boxes) = (s.id, s.boxes.clone());
+    f.project
+        .edit(id, boxes, Decision::Keep, true, false)
+        .unwrap();
+    let s = &f.project.samples[0];
+    assert!(!s.automatic_label && !s.background);
+    assert_eq!(s.decision_origin, DecisionOrigin::Manual);
 }
 #[test]
 fn imports_corrupt_image() {
@@ -522,4 +868,7 @@ fn corrupt_images_do_not_abort_other_proposals() {
         1
     );
     assert!(!f.project.warnings.is_empty());
+    assert_eq!(f.project.samples[0].decision, Decision::Fix);
+    assert!(f.project.undo());
+    assert_eq!(f.project.samples[0].decision, Decision::Keep);
 }

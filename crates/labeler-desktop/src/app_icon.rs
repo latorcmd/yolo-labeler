@@ -43,7 +43,10 @@ pub fn install() {
         }
         let mut title = [0u16; 128];
         let len = unsafe { GetWindowTextW(window, title.as_mut_ptr(), title.len() as i32) };
-        if String::from_utf16_lossy(&title[..len.max(0) as usize]) != "YOLO Labeler — AntiWebUI" {
+        if !matches!(
+            String::from_utf16_lossy(&title[..len.max(0) as usize]).as_str(),
+            "YOLO Labeler" | "YOLO Labeler — AntiWebUI"
+        ) {
             return 1;
         }
         let module = unsafe { GetModuleHandleW(std::ptr::null()) };

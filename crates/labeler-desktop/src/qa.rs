@@ -61,11 +61,16 @@ pub fn screen(
     };
     use anti_webui::wgpu::{Gpu, Renderer, wgpu::TextureFormat};
     let started = Instant::now();
-    let width = (1480. * scale) as u32;
-    let height = (940. * scale) as u32;
+    let small = std::env::args().any(|arg| arg == "--qa-small");
+    let width = ((if small { 960. } else { 1480. }) * scale) as u32;
+    let height = ((if small { 540. } else { 940. }) * scale) as u32;
     let gpu = Gpu::headless().map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let mut renderer = Renderer::new(&gpu.device, TextureFormat::Rgba8Unorm);
-    let mut ui = Ui::new(move || app_with(project, Some(dark), edit));
+    let help_screen = std::env::args().any(|arg| arg == "--qa-help");
+    let mut ui = Ui::new(move || {
+        let root = app_with(project, Some(dark), edit);
+        if help_screen { help::content() } else { root }
+    });
     ui.handle_event(WindowEvent::Resized {
         size: SizeI::new(width as i32, height as i32),
         scale: Scale::from_f64(scale),
@@ -98,6 +103,48 @@ pub fn screen(
         }
         assert_eq!(c.editing.get(), c.edit.with(|e| e.is_some()));
     }
+    let mut navigation = vec![];
+    if std::env::args().any(|arg| arg == "--qa-page-bench") {
+        let origin = c.state.borrow().project.as_ref().unwrap().view.page;
+        for warm in [false, true] {
+            if warm {
+                for page in origin..=origin + 20 {
+                    c.state.borrow_mut().project.as_mut().unwrap().view.page = page;
+                    c.bump();
+                    ui.update();
+                    ui.wait_for_images(Duration::from_secs(10));
+                    ui.update();
+                }
+            }
+            for _ in 0..20 {
+                if !warm {
+                    let mut state = c.state.borrow_mut();
+                    state.cache.clear();
+                    state.lru.clear();
+                    state.cache_bytes = 0;
+                }
+                let start = Instant::now();
+                c.page(if warm { -1 } else { 1 });
+                ui.update();
+                let scene = ui.paint(Instant::now());
+                let _ = gpu.render_to_rgba(&mut renderer, &scene);
+                let first_ms = start.elapsed().as_secs_f64() * 1000.;
+                let ids = c.page_ids();
+                while !ids.iter().all(|id| c.state.borrow().cache.contains_key(id))
+                    && start.elapsed() < Duration::from_secs(10)
+                {
+                    ui.wait_for_images(Duration::from_millis(1));
+                    ui.update();
+                }
+                ui.update();
+                let scene = ui.paint(Instant::now());
+                let _ = gpu.render_to_rgba(&mut renderer, &scene);
+                let ready = ids.iter().all(|id| c.state.borrow().cache.contains_key(id));
+                navigation.push(serde_json::json!({"warm":warm,"first_ms":first_ms,"complete_ms":start.elapsed().as_secs_f64()*1000.,"ready":ready}));
+            }
+        }
+        anyhow::ensure!(c.flush(), "navigation benchmark final save failed");
+    }
     let mut cycles = vec![];
     if stress {
         let pages = c
@@ -111,11 +158,12 @@ pub fn screen(
             let start = Instant::now();
             let mut maximum = 0;
             for page in 0..pages {
-                {
-                    let mut state = c.state.borrow_mut();
-                    state.project.as_mut().unwrap().view.page = page;
+                if page == 0 {
+                    c.page(-(pages as isize));
+                    c.bump();
+                } else {
+                    c.page(1);
                 }
-                c.bump();
                 ui.update();
                 ui.wait_for_images(Duration::from_secs(10));
                 ui.update();
@@ -127,6 +175,9 @@ pub fn screen(
             assert!(state.cache_bytes <= 128 << 20);
             cycles.push(serde_json::json!({"cycle":cycle,"pages":pages,"ms":start.elapsed().as_millis(),"cache_bytes":state.cache_bytes,"cached_images":state.cache.len(),"working_set":working_set(),"maximum_working_set":maximum}));
         }
+    }
+    if stress {
+        anyhow::ensure!(c.flush(), "stress final save failed");
     }
     ui.wait_for_images(Duration::from_secs(30));
     let start = Instant::now();
@@ -140,7 +191,7 @@ pub fn screen(
     let pixels = gpu.render_to_rgba(&mut renderer, &scene);
     anti_webui::app::headless::write_png(output, width, height, &pixels)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let stats = serde_json::json!({"scale":scale,"dark":dark,"roundtrip":roundtrip,"cycles":cycles,"working_set":working_set(),"elapsed_ms":started.elapsed().as_millis()});
+    let stats = serde_json::json!({"scale":scale,"dark":dark,"roundtrip":roundtrip,"navigation":navigation,"cycles":cycles,"working_set":working_set(),"elapsed_ms":started.elapsed().as_millis()});
     std::fs::write(
         output.with_extension("metrics.json"),
         serde_json::to_vec_pretty(&stats)?,
