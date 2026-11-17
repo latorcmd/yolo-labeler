@@ -51,6 +51,7 @@ struct Controller {
     sort: Signal<usize>,
     crop: Signal<bool>,
     viewport: Signal<(f32, f32)>,
+    keyboard_focus: NodeRef,
     edit: Signal<Option<editor::Edit>>,
     editing: Signal<bool>,
     preview: Signal<Option<Preview>>,
@@ -530,6 +531,7 @@ impl Controller {
         }
         self.save();
         self.bump();
+        self.keyboard_focus.focus();
     }
     fn toggle(&self, id: Uuid) {
         if !self.project_ready() {
@@ -556,6 +558,8 @@ impl Controller {
             let mut state = self.state.borrow_mut();
             state.selection.clear();
             state.selection.insert(id);
+            drop(state);
+            self.keyboard_focus.focus();
         }
     }
     fn wheel(&self, delta: f64) {
@@ -1157,6 +1161,7 @@ fn app_with(project: Option<Project>, qa_theme: Option<bool>, qa_edit: bool) -> 
     let sort = signal(initial_view.sort);
     let crop = signal(initial_view.crop);
     let viewport = signal((1480_f32, 720_f32));
+    let keyboard_root = node_ref();
     let event_state = state.clone();
     let controller_slot = Rc::new(RefCell::new(None::<Controller>));
     let event_controller = controller_slot.clone();
@@ -1315,6 +1320,7 @@ fn app_with(project: Option<Project>, qa_theme: Option<bool>, qa_edit: bool) -> 
         sort,
         crop,
         viewport,
+        keyboard_focus: keyboard_root,
         edit,
         editing,
         preview,
@@ -1404,11 +1410,20 @@ fn app_with(project: Option<Project>, qa_theme: Option<bool>, qa_edit: bool) -> 
     let wheel = c.clone();
     let footer = c.clone();
     let cancel_job = c.clone();
-    let keyboard_root = node_ref();
     let initial_focus = std::cell::Cell::new(false);
     div()
+        .relative()
         .focusable()
-        .node_ref(keyboard_root)
+        .child(
+            div()
+                .absolute()
+                .left(0.)
+                .top(0.)
+                .w(1.)
+                .h(1.)
+                .focusable()
+                .node_ref(keyboard_root),
+        )
         .on_resized(move |_, _| {
             if !initial_focus.replace(true) {
                 keyboard_root.focus();
@@ -1420,6 +1435,8 @@ fn app_with(project: Option<Project>, qa_theme: Option<bool>, qa_edit: bool) -> 
         .p(14_f32)
         .w_full()
         .h_full()
+        .min_h(0.)
+        .overflow_hidden()
         .dyn_style(|s| s.bg(theme().page).text_color(theme().text))
         .child(
             div()
