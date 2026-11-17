@@ -1,0 +1,11 @@
+[package]
+name = "labeler-vision"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = "1"
+image = { version = "0.25.10", default-features = false, features = ["bmp", "jpeg", "png", "webp"] }
+imageproc = { version = "0.27", default-features = false }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"

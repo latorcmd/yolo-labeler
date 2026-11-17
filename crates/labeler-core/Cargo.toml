@@ -1,0 +1,20 @@
+[package]
+name = "labeler-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+labeler-vision = { path = "../labeler-vision" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
+walkdir = "2"
+tempfile = "3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+csv = "1"
+
+[dev-dependencies]
+tempfile = "3"

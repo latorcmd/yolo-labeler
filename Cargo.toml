@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/labeler-core", "crates/labeler-vision", "crates/labeler-desktop"]
+
+[workspace.package]
+edition = "2024"
+version = "0.2.0"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+# AntiWebUI's Windows backend uses adapter_filter from this upstream fork.
+[patch.crates-io]
+naga = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }
+naga-types = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }
+wgpu = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }
+wgpu-core = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }
+wgpu-core-deps-apple = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }
+wgpu-core-deps-emscripten = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }
+wgpu-core-deps-windows-linux-android = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }
+wgpu-hal = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }
+wgpu-naga-bridge = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }
+wgpu-types = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }
