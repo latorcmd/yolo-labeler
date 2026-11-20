@@ -1330,6 +1330,7 @@ dependencies = [
  "csv",
  "image",
  "labeler-vision",
+ "rand 0.10.4",
  "serde",
  "serde_json",
  "sha2",
@@ -1361,6 +1362,7 @@ dependencies = [
  "anyhow",
  "image",
  "imageproc",
+ "rand 0.10.4",
  "serde",
  "sha2",
 ]

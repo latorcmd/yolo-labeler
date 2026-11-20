@@ -1,4 +1,5 @@
 use super::*;
+use labeler_core::ImportLabelSource;
 
 pub fn open(
     c: Controller,
@@ -22,7 +23,7 @@ pub fn open(
         WindowOptions {
             title: "画像の追加 — 対象とラベル".into(),
             width: 760,
-            height: 520,
+            height: 600,
             modal: true,
             dialog: true,
             ..Default::default()
@@ -30,6 +31,7 @@ pub fn open(
         move || {
             theme::follow_system();
             let background = signal(false);
+            let label_source = signal(ImportLabelSource::Existing);
             let class = signal(0usize);
             let csv = signal(String::new());
             let start = c.clone();
@@ -43,17 +45,29 @@ pub fn open(
             .child(heading("今回追加する画像について選んでください"))
             .child(text(root.display().to_string()))
             .child(checkbox(background,"対象なし — 背景画像として追加する"))
-            .child(text("チェックなしは対象あり。正常な既存ラベルを優先し、枠がない画像は下のクラスで自動ラベリングします。背景と対象ありの画像が混在する場合は分けて追加してください。"))
+            .child(text("背景と対象ありの画像が混在する場合は分けて追加してください。"))
+            .child(text("画像ごとのラベルTXT"))
+            .child(select(label_source, vec![
+                (ImportLabelSource::Existing, "既存のTXTを使う".into()),
+                (ImportLabelSource::Otsu, "既存のTXTを使わない（大津法 / Otsu）".into()),
+            ]).on_key_down(|e|e.stop_propagation()))
+            .child(text(move || match (background.get(), label_source.get()) {
+                (true, ImportLabelSource::Existing) => "既存の対象枠がある場合は追加前に確認します。",
+                (true, ImportLabelSource::Otsu) => "既存のTXTを無視し、枠なしの背景として追加します。",
+                (false, ImportLabelSource::Existing) => "既存の正常な枠を優先し、枠がない画像は下のクラスで自動検出します。",
+                (false, ImportLabelSource::Otsu) => "既存のTXTを無視し、すべての追加画像を大津法で検出して下のクラスを付けます。",
+            }))
             .child(show(move||!background.get(),move|| {let names=names.clone();div().flex().flex_col().gap(10_f32).child(div().flex().flex_row().gap(12_f32).items_center().child(text("自動ラベルのクラス"))
                 .child(select(class,names.iter().enumerate().map(|(id,name)|(id,name.clone())).collect()).on_key_down(|e|e.stop_propagation())))
             .child(div().flex().flex_row().gap(8_f32)
                 .child(text_field(csv).placeholder("番号範囲CSV（任意）").w(440.).on_key_down(|e|e.stop_propagation()))
                 .child(button("CSVを選ぶ").on_click(move |_|{if let Some(path)=rfd::FileDialog::new().add_filter("番号範囲",&["csv"]).pick_file(){csv.set(path.to_string_lossy().into_owned());}})))}))
-            .child(text("自動検出した枠は採用します。検出できない画像や不正なラベルは要確認として残します。枠の検出には標準の二値化設定を使用します。画像からH・S・Uの種類を判定する機能ではありません。"))
+            .child(text("自動検出した枠は採用します。検出できない画像や不正なラベルは要確認として残します。画像からH・S・Uの種類を判定する機能ではありません。"))
             .child(button("追加する").on_click(move |_|{
                 let all_paths=if paths.is_empty(){labeler_core::image_files(&root)}else{paths.clone()};
                 if all_paths.is_empty(){message("対応する画像がありません");return;}
-                if background.get() {
+                let source = label_source.get();
+                if background.get() && source == ImportLabelSource::Existing {
                     let project=if let Some((file,_))=&new {Project::new(file.clone(),classes.clone())}else{Ok(start.state.borrow().project.as_ref().unwrap().save_snapshot())};
                     let conflicts=project.and_then(|project|project.preflight_background_conflicts(&root,&all_paths,labels.as_deref()));
                     match conflicts {
@@ -65,7 +79,7 @@ pub fn open(
                         Err(error)=>{message(error.to_string());return;}, _=>{}
                     }
                 }
-                let options=labeler_core::ImportOptions{background:background.get(),fixed_class:class.get(),ranges:if csv.get().trim().is_empty(){None}else{Some(PathBuf::from(csv.get()))},detector:DetectorConfig::default()};
+                let options=labeler_core::ImportOptions{background:background.get(),label_source:source,fixed_class:class.get(),ranges:if csv.get().trim().is_empty(){None}else{Some(PathBuf::from(csv.get()))},detector:DetectorConfig::default()};
                 if !options.background {if let Some(path)=&options.ranges {if let Err(error)=labeler_core::read_ranges(path,classes.len()){message(error.to_string());return;}}}
                 if let Some((file,classes))=&new {start.job(Job::New(file.clone(),classes.clone(),root.clone(),labels.clone(),options));}
                 else {start.job(Job::Import(root.clone(),all_paths,labels.clone(),options));}

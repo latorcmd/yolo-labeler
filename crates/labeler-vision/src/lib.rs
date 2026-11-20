@@ -4,6 +4,8 @@
 //! Coordinates use the source image's unrotated pixel space, matching YOLO
 //! labels in the project.
 
+pub mod augment;
+
 use std::{fs, path::Path};
 
 use anyhow::{Context, Result, bail};
@@ -132,6 +134,20 @@ struct Component {
 /// The detector returns class ID 0 as a placeholder; class assignment belongs
 /// to the project/core layer. EXIF orientation is never applied here.
 pub fn detect(image: &DynamicImage, config: &DetectorConfig) -> Result<Detection> {
+    detect_internal(image, config, false)
+}
+
+/// Detect with Otsu's threshold even if a manual threshold was configured.
+/// This mode uses the Otsu mask directly, without the alternate HSV threshold.
+pub fn detect_otsu(image: &DynamicImage, config: &DetectorConfig) -> Result<Detection> {
+    detect_internal(image, config, true)
+}
+
+fn detect_internal(
+    image: &DynamicImage,
+    config: &DetectorConfig,
+    otsu_only: bool,
+) -> Result<Detection> {
     config.validate()?;
     let width = image.width();
     let height = image.height();
@@ -142,7 +158,8 @@ pub fn detect(image: &DynamicImage, config: &DetectorConfig) -> Result<Detection
     let pixel_count = u64::from(width) * u64::from(height);
     let mut flags = Vec::new();
 
-    let (mut mask, mut method, mut chosen_threshold) = match config.threshold {
+    let manual_threshold = if otsu_only { None } else { config.threshold };
+    let (mut mask, mut method, mut chosen_threshold) = match manual_threshold {
         Some(value) => (
             threshold(&gray, value, ThresholdType::BinaryInverted),
             "manual".to_owned(),
@@ -159,9 +176,14 @@ pub fn detect(image: &DynamicImage, config: &DetectorConfig) -> Result<Detection
     };
 
     let initial_foreground_ratio = foreground_ratio(&mask, pixel_count);
-    let (mut bounds, mut component_count) = select_components(&mask, config)?;
+    let (mut bounds, mut component_count) = if otsu_only && initial_foreground_ratio == 1.0 {
+        (None, 0)
+    } else {
+        select_components(&mask, config)?
+    };
 
-    if config.threshold.is_none()
+    if !otsu_only
+        && manual_threshold.is_none()
         && (initial_foreground_ratio > 0.5
             || bounds.is_some_and(|bounds| bounds.area() as f64 / pixel_count as f64 > 0.9))
     {

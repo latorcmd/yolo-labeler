@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+rand = { version = "0.10", default-features = false, features = ["std_rng"] }
 labeler-vision = { path = "../labeler-vision" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

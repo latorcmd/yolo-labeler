@@ -381,6 +381,86 @@ fn import_present_keeps_existing_and_detects_missing_boxes() {
 }
 
 #[test]
+fn otsu_import_ignores_valid_invalid_and_empty_source_labels() {
+    let mut f = Fixture::new();
+    let paths = [
+        f.image("valid.png", Some("0 .5 .5 .2 .2")),
+        f.image("invalid.png", Some("bad")),
+        f.image("empty.png", Some("")),
+        f.image("no-target.png", Some("0 .5 .5 .2 .2")),
+    ];
+    fs::write(f.source.join("classes.txt"), "Unrelated\n").unwrap();
+    let image = image::RgbImage::from_fn(32, 24, |x, _| {
+        image::Rgb([if x < 24 { 100 } else { 255 }; 3])
+    });
+    for path in &paths[..3] {
+        image.save(path).unwrap();
+    }
+    let options = ImportOptions {
+        label_source: ImportLabelSource::Otsu,
+        detector: DetectorConfig {
+            threshold: Some(255),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    f.project
+        .import_with_options(&f.source, &paths, None, &options, &flag(), &mut |_, _| {})
+        .unwrap();
+
+    for sample in &f.project.samples[..3] {
+        assert!(sample.automatic_label && !sample.background);
+        assert_eq!(sample.decision, Decision::Keep);
+        assert!(sample.label_errors.is_empty());
+        assert_eq!(sample.boxes[0].width, 0.75);
+        let imported_txt = f.project.image_path(sample).unwrap().with_extension("txt");
+        let (boxes, errors) = parse_yolo(&fs::read_to_string(imported_txt).unwrap(), 1);
+        assert_eq!(boxes, sample.boxes);
+        assert!(errors.is_empty());
+    }
+    let missed = &f.project.samples[3];
+    assert_eq!(missed.decision, Decision::Fix);
+    assert!(!missed.has_label && !missed.background && !missed.automatic_label);
+    assert!(
+        !f.project
+            .image_path(missed)
+            .unwrap()
+            .with_extension("txt")
+            .exists()
+    );
+    for (path, label) in paths
+        .iter()
+        .zip(["0 .5 .5 .2 .2", "bad", "", "0 .5 .5 .2 .2"])
+    {
+        assert_eq!(
+            fs::read_to_string(path.with_extension("txt")).unwrap(),
+            label
+        );
+    }
+}
+
+#[test]
+fn ignoring_existing_labels_allows_explicit_background() {
+    let mut f = Fixture::new();
+    let path = f.image("background.png", Some("0 .5 .5 .2 .2"));
+    let options = ImportOptions {
+        background: true,
+        label_source: ImportLabelSource::Otsu,
+        ..Default::default()
+    };
+    f.project
+        .import_with_options(&f.source, &[path], None, &options, &flag(), &mut |_, _| {})
+        .unwrap();
+    let sample = &f.project.samples[0];
+    assert!(sample.background && sample.approvable() && !sample.automatic_label);
+    assert!(
+        fs::read(f.project.image_path(sample).unwrap().with_extension("txt"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn failed_detection_stays_fix_and_cancel_does_not_publish() {
     let mut f = Fixture::new();
     let a = f.image("1.png", None);
@@ -584,6 +664,47 @@ fn import_failed_source_no_partial_state() {
             .is_err()
     );
     assert!(f.project.samples.is_empty());
+}
+#[test]
+fn background_selection_undoes_as_a_group() {
+    let mut f = Fixture::populated(3);
+    f.project.samples[0].proposal_pending = true;
+    f.project.samples[1].decision = Decision::Exclude;
+    let before = f.project.samples.clone();
+    f.project.mark_background(&[before[0].id, before[1].id]);
+    for s in &f.project.samples[..2] {
+        assert!(s.background && s.has_label && s.reviewed);
+        assert!(s.boxes.is_empty() && !s.proposal_pending);
+    }
+    assert_eq!(f.project.samples[0].decision, Decision::Keep);
+    assert_eq!(f.project.samples[1].decision, Decision::Exclude);
+    assert_eq!(f.project.samples[2], before[2]);
+    assert!(f.project.undo());
+    assert_eq!(f.project.samples, before);
+}
+
+#[test]
+fn matching_image_stems_get_unique_copy_names() {
+    let mut f = Fixture::new();
+    let label = "0 .5 .5 .3 .4";
+    let first = f.image("H/000123.png", Some(label));
+    let second = f.image("S/000123.bmp", Some(label));
+    let third = f.image("U/000123.PNG", Some(label));
+    f.import(&[first, second.clone()]);
+    f.import(&[third]);
+    let names = f
+        .project
+        .samples
+        .iter()
+        .map(|s| s.path.file_name().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["000123.png", "000123_2.bmp", "000123_3.PNG"]);
+    assert_eq!(f.project.samples[1].boxes.len(), 1);
+    assert!(second.is_file());
+    assert_eq!(
+        fs::read_to_string(second.with_extension("txt")).unwrap(),
+        label
+    );
 }
 #[test]
 fn commit_and_undo() {
@@ -871,4 +992,134 @@ fn corrupt_images_do_not_abort_other_proposals() {
     assert_eq!(f.project.samples[0].decision, Decision::Fix);
     assert!(f.project.undo());
     assert_eq!(f.project.samples[0].decision, Decision::Keep);
+}
+
+#[test]
+fn batch_class_change_only_updates_existing_boxes_and_undoes_together() {
+    let mut f = Fixture::populated(3);
+    f.project.set_classes(vec!["H".into(), "S".into()]).unwrap();
+    let [a, b, _] = f.project.samples.as_mut_slice() else {
+        unreachable!()
+    };
+    b.boxes.clear();
+    b.background = true;
+    let mut second_box = a.boxes[0].clone();
+    second_box.cx = 0.25;
+    a.boxes.push(second_box);
+    a.proposals = vec![a.boxes[0].clone()];
+    a.proposal_pending = true;
+    let selected = [a.id, b.id];
+    let original = serde_json::to_value(&f.project.samples).unwrap();
+    assert_eq!(f.project.change_box_class(&selected, 1).unwrap(), 1);
+    let mut expected = original.clone();
+    for bbox in expected[0]["boxes"].as_array_mut().unwrap() {
+        bbox["class_id"] = 1.into();
+    }
+    assert_eq!(serde_json::to_value(&f.project.samples).unwrap(), expected);
+    assert_eq!(f.project.change_box_class(&selected, 1).unwrap(), 0);
+    assert!(f.project.undo());
+    assert_eq!(serde_json::to_value(&f.project.samples).unwrap(), original);
+}
+
+#[test]
+fn batch_removal_persists_without_recovery_resurrecting_images_and_undo_restores_order() {
+    let mut f = Fixture::populated(5);
+    let original = f.project.samples.clone();
+    let removed = [original[1].id, original[3].id, original[4].id];
+    assert_eq!(f.project.remove_samples(&removed), 3);
+    f.project.save().unwrap();
+    let journal = f
+        .project
+        .assets()
+        .join("transactions")
+        .join("leftover.json");
+    fs::write(&journal, serde_json::to_vec(&original).unwrap()).unwrap();
+    let reopened = Project::load(&f.project.file).unwrap();
+    assert_eq!(
+        reopened.samples.iter().map(|s| s.id).collect::<Vec<_>>(),
+        vec![original[0].id, original[2].id]
+    );
+    let new_path = f.image("new.png", Some("0 .5 .5 .3 .4"));
+    f.import(&[new_path]);
+    let added = f.project.samples.last().unwrap().id;
+    assert!(!journal.exists());
+    assert!(f.project.undo());
+    let expected = original
+        .iter()
+        .map(|s| s.id)
+        .chain([added])
+        .collect::<Vec<_>>();
+    assert_eq!(
+        f.project.samples.iter().map(|s| s.id).collect::<Vec<_>>(),
+        expected
+    );
+    for sample in &original {
+        assert!(sample.origin_root.join(&sample.origin_relative).is_file());
+        assert!(f.project.image_path(sample).unwrap().is_file());
+    }
+}
+
+#[test]
+fn batch_otsu_replaces_selected_boxes_and_leaves_no_partial_changes_on_cancel() {
+    let mut f = Fixture::new();
+    let paths = [
+        f.image("1.png", Some("0 .5 .5 .2 .2")),
+        f.image("2.png", Some("0 .5 .5 .2 .2")),
+        f.image("3.png", Some("0 .5 .5 .2 .2")),
+    ];
+    let image = image::RgbImage::from_fn(32, 24, |x, y| {
+        image::Rgb(
+            [if (8..24).contains(&x) && (6..18).contains(&y) {
+                0
+            } else {
+                255
+            }; 3],
+        )
+    });
+    image.save(&paths[0]).unwrap();
+    f.import(&paths);
+    f.project.set_classes(vec!["H".into(), "S".into()]).unwrap();
+    let [a, b, _] = f.project.samples.as_mut_slice() else {
+        unreachable!()
+    };
+    a.decision = Decision::Hold;
+    a.decision_origin = DecisionOrigin::Manual;
+    a.proposals = a.boxes.clone();
+    a.proposal_pending = true;
+    a.proposal_info = serde_json::json!({"method":"old"});
+    let selected = [a.id, b.id];
+    let original = serde_json::to_value(&f.project.samples).unwrap();
+
+    let stop = flag();
+    assert!(
+        f.project
+            .replace_boxes_with_otsu(&selected, 1, &stop, &mut |done, total| {
+                if done == total {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            })
+            .is_err()
+    );
+    assert_eq!(serde_json::to_value(&f.project.samples).unwrap(), original);
+    assert!(f.project.undo.is_empty());
+
+    assert_eq!(
+        f.project
+            .replace_boxes_with_otsu(&selected, 1, &flag(), &mut |_, _| {})
+            .unwrap(),
+        (1, 1)
+    );
+    let [a, b, c] = f.project.samples.as_slice() else {
+        unreachable!()
+    };
+    assert_eq!(a.decision, Decision::Hold);
+    assert_eq!(a.decision_origin, DecisionOrigin::Manual);
+    assert!(a.automatic_label && a.approvable() && a.proposal_info.is_null());
+    assert_eq!(a.boxes[0].class_id, 1);
+    assert_eq!(a.boxes[0].width, 0.5);
+    assert_eq!(b.decision, Decision::Fix);
+    assert!(b.boxes.is_empty() && !b.has_label && !b.label_errors.is_empty());
+    assert_eq!(serde_json::to_value(c).unwrap(), original[2]);
+    assert!(f.project.undo());
+    assert_eq!(serde_json::to_value(&f.project.samples).unwrap(), original);
 }

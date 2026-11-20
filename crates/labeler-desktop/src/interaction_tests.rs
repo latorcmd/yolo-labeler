@@ -252,3 +252,163 @@ fn intake_requested_from_a_closing_dialog_belongs_to_the_main_window() {
     drop(child);
     cleanup(ui, c, path);
 }
+
+#[test]
+fn added_batch_appears_after_existing_images_in_default_order() {
+    let (ui, c, path) = setup();
+    let existing = c.visible();
+    let batch = Uuid::new_v4();
+    {
+        let mut state = c.state.borrow_mut();
+        let samples = &mut state.project.as_mut().unwrap().samples;
+        for filename in ["frame10.png", "frame2.png", "0.png"] {
+            let mut sample = samples[0].clone();
+            sample.id = Uuid::new_v4();
+            sample.batch = batch;
+            sample.origin_relative = filename.into();
+            samples.push(sample);
+        }
+    }
+    let visible = c.visible();
+    assert_eq!(&visible[..existing.len()], &existing);
+    assert_eq!(&visible[existing.len()..], &[42, 41, 40]);
+    c.sort.set(4);
+    assert_eq!(c.visible()[0], 42);
+    cleanup(ui, c, path);
+}
+
+#[test]
+fn held_navigation_key_repeats_until_released() {
+    use std::time::{Duration, Instant};
+    let (mut ui, c, path) = setup();
+    let arrow = |pressed, repeat| {
+        WindowEvent::Key(KeyEvent {
+            key: Key::Named(NamedKey::ArrowRight),
+            text: None,
+            modifiers: Modifiers::default(),
+            pressed,
+            repeat,
+        })
+    };
+    ui.handle_event(arrow(true, false));
+    assert_eq!(page(&c), 1);
+    ui.handle_event(arrow(true, true));
+    assert_eq!(page(&c), 1);
+    let start = Instant::now();
+    ui.animate(start + Duration::from_millis(500));
+    assert_eq!(page(&c), 2);
+    ui.handle_event(arrow(false, false));
+    ui.animate(start + Duration::from_secs(3));
+    assert_eq!(page(&c), 2);
+    cleanup(ui, c, path);
+}
+
+#[test]
+fn page_button_hold_stops_on_release_or_focus_loss() {
+    use std::time::{Duration, Instant};
+    let (mut ui, c, path) = setup();
+    let button = |pressed| WindowEvent::PointerButton {
+        position: PointF::new(230., 885.),
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::default(),
+        time: 10,
+    };
+    ui.handle_event(button(true));
+    assert_eq!(page(&c), 1);
+    let start = Instant::now();
+    ui.animate(start + Duration::from_millis(500));
+    assert_eq!(page(&c), 2);
+    ui.handle_event(button(false));
+    ui.animate(start + Duration::from_secs(1));
+    assert_eq!(page(&c), 2);
+    ui.handle_event(button(true));
+    assert_eq!(page(&c), 3);
+    ui.handle_event(WindowEvent::Focused(false));
+    assert!(c.page_hold.borrow().is_none());
+    cleanup(ui, c, path);
+}
+
+#[test]
+fn opening_project_shows_thumbnails_after_clearing_saved_search() {
+    let dir = std::env::temp_dir().join(format!("ylp2-filter-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("saved.ylp2");
+    let source = dir.join("source");
+    std::fs::create_dir(&source).unwrap();
+    let image = source.join("sample.png");
+    image::RgbImage::from_pixel(10, 10, image::Rgb([20, 40, 60]))
+        .save(&image)
+        .unwrap();
+    let mut p = Project::new(path.clone(), vec!["H".into()]).unwrap();
+    p.import(
+        &source,
+        &[image],
+        None,
+        &AtomicBool::new(false),
+        &mut |_, _| {},
+    )
+    .unwrap();
+    let id = p.samples[0].id;
+    p.view.search = "一致しない".into();
+    p.save().unwrap();
+
+    let mut ui = Ui::new(|| app_with(None, Some(false), false));
+    ui.update();
+    let c = QA_CONTROLLER.with(|v| v.borrow().as_ref().unwrap().clone());
+    c.job(Job::Load(path.clone()));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while c.busy.get_untracked() && std::time::Instant::now() < deadline {
+        ui.update();
+        ui.wait_for_images(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!c.busy.get_untracked());
+    assert!(c.job_error.get_untracked().is_none());
+    assert_eq!(c.state.borrow().project.as_ref().unwrap().samples.len(), 1);
+    assert!(c.visible().is_empty());
+    c.clear_filters();
+    ui.update();
+    ui.wait_for_images(std::time::Duration::from_secs(3));
+    assert_eq!(c.page_ids(), vec![id]);
+    assert!(
+        c.state
+            .borrow()
+            .thumbnail_slots
+            .get(&id)
+            .unwrap()
+            .bitmap
+            .get_untracked()
+            .is_some()
+    );
+    assert!(c.flush());
+    cleanup(ui, c, dir);
+}
+
+#[test]
+fn page_selection_toggles_visible_page_and_keeps_other_pages_selected() {
+    let (mut ui, c, path) = setup();
+    let first = c.page_ids();
+    c.toggle_selection(first[0]);
+    c.toggle_page_selection();
+    assert_eq!(c.state.borrow().selection, first.iter().copied().collect());
+    c.page(1);
+    let second = c.page_ids();
+    c.toggle_page_selection();
+    let expected = first.iter().chain(&second).copied().collect();
+    assert_eq!(c.state.borrow().selection, expected);
+    c.toggle_page_selection();
+    assert_eq!(c.state.borrow().selection, first.iter().copied().collect());
+    c.search.set("frame1".into());
+    ui.update();
+    assert!(c.state.borrow().selection.is_empty());
+    let filtered = c.page_ids();
+    c.toggle_page_selection();
+    assert_eq!(
+        c.state.borrow().selection,
+        filtered.iter().copied().collect()
+    );
+    c.clear_selection();
+    assert!(c.state.borrow().selection.is_empty());
+    cleanup(ui, c, path);
+}

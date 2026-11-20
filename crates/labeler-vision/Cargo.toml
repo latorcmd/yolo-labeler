@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+rand = { version = "0.10", default-features = false, features = ["std_rng"] }
 anyhow = "1"
 image = { version = "0.25.10", default-features = false, features = ["bmp", "jpeg", "png", "webp"] }
 imageproc = { version = "0.27", default-features = false }

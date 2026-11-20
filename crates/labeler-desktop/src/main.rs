@@ -13,7 +13,7 @@ use anti_webui::{core::images::Bitmap, prelude::*};
 use anyhow::{Context, Result};
 use labeler_core::{Decision, DetectorConfig, Project, Sample};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     rc::Rc,
@@ -24,6 +24,12 @@ use std::{
 };
 use uuid::Uuid;
 
+struct ThumbnailSlot {
+    token: u64,
+    bitmap: Signal<Option<Arc<Bitmap>>>,
+    failed: Signal<bool>,
+}
+
 #[derive(Default)]
 struct State {
     project: Option<Project>,
@@ -31,11 +37,11 @@ struct State {
     cache: HashMap<Uuid, Arc<Bitmap>>,
     lru: VecDeque<Uuid>,
     cache_bytes: usize,
-    loading: HashSet<Uuid>,
+    thumbnail_errors: HashSet<Uuid>,
     request: u64,
     dirty: bool,
     save_generation: u64,
-    thumbnail_slots: HashMap<Uuid, (u64, Signal<Option<Arc<Bitmap>>>)>,
+    thumbnail_slots: HashMap<Uuid, ThumbnailSlot>,
     next_slot: u64,
     last_wheel: Option<std::time::Instant>,
 }
@@ -44,6 +50,7 @@ struct Controller {
     state: Rc<RefCell<State>>,
     version: Signal<u64>,
     status: Signal<String>,
+    job_error: Signal<Option<String>>,
     busy: Signal<bool>,
     search: Signal<String>,
     filter: Signal<usize>,
@@ -52,6 +59,7 @@ struct Controller {
     crop: Signal<bool>,
     viewport: Signal<(f32, f32)>,
     keyboard_focus: NodeRef,
+    page_hold: Rc<RefCell<Option<(PageHold, Rc<Cell<bool>>)>>>,
     edit: Signal<Option<editor::Edit>>,
     editing: Signal<bool>,
     preview: Signal<Option<Preview>>,
@@ -59,6 +67,11 @@ struct Controller {
     events: UiSender<Event>,
     thumbnails: thumbnails::Loader,
     saver: persistence::Saver,
+}
+#[derive(Clone, PartialEq, Eq)]
+enum PageHold {
+    Key(Key),
+    Button(isize),
 }
 thread_local! {static QA_CONTROLLER:RefCell<Option<Controller>>=const{RefCell::new(None)};}
 #[derive(Clone)]
@@ -101,8 +114,9 @@ enum Job {
     ),
     Quality,
     Propose(DetectorConfig, usize, Option<PathBuf>),
+    ReplaceBoxesWithOtsu(Vec<Uuid>, usize),
     External(Uuid, PathBuf),
-    Export(PathBuf),
+    Export(PathBuf, Option<(labeler_core::AugmentOptions, u64)>),
 }
 fn message(text: impl AsRef<str>) {
     rfd::MessageDialog::new()
@@ -231,6 +245,7 @@ impl Controller {
         let sender = self.events.clone();
         let stop = self.cancel.clone();
         let keep_view = !matches!(&job, Job::New(..) | Job::Load(..) | Job::Import(..));
+        self.job_error.set(None);
         self.status.set("処理中…".into());
         std::thread::spawn(move || {
             let mut progress = |a, b| sender.send(Event::Progress(request, a, b));
@@ -251,7 +266,10 @@ impl Controller {
                         Ok((p, format!("{n}枚を読み込みました")))
                     }
                     Job::Load(path) => {
-                        Ok((Project::load(&path)?, "プロジェクトを開きました".into()))
+                        let p = Project::load(&path).with_context(|| {
+                            format!("プロジェクトを開けません: {}", path.display())
+                        })?;
+                        Ok((p, "プロジェクトを開きました".into()))
                     }
                     other => {
                         let p = project
@@ -274,14 +292,8 @@ impl Controller {
                                     &mut progress,
                                 )?;
                                 if n > 0 {
-                                    let added = p.samples[first].id;
-                                    let page = {
-                                        let mut order = p.samples.iter().collect::<Vec<_>>();
-                                        order.sort_by(|a, b| sample_order(a, b));
-                                        order.iter().position(|s| s.id == added).unwrap_or(0) / 10
-                                    };
                                     p.view = labeler_core::ViewState {
-                                        page,
+                                        page: first / 10,
                                         ..Default::default()
                                     };
                                 }
@@ -290,6 +302,13 @@ impl Controller {
                             Job::Quality => {
                                 p.analyze(&stop, &mut progress)?;
                                 "品質・完全重複を検査しました".into()
+                            }
+                            Job::ReplaceBoxesWithOtsu(ids, class) => {
+                                let (detected, failed) =
+                                    p.replace_boxes_with_otsu(&ids, class, &stop, &mut progress)?;
+                                format!(
+                                    "大津法で{detected}枚の枠を更新しました（検出できなかった画像 {failed}枚）"
+                                )
                             }
                             Job::Propose(config, class, ranges) => {
                                 let n = p.propose(
@@ -305,9 +324,27 @@ impl Controller {
                                 let n = p.import_proposals(batch, &labels, &stop, &mut progress)?;
                                 format!("外部候補を{n}枚に読み込みました")
                             }
-                            Job::Export(path) => {
-                                p.export(&path, &stop, &mut progress)?;
-                                format!("検査済みZIPを書き出しました: {}", path.display())
+                            Job::Export(path, options) => {
+                                let report = p.export_with_augmentation(
+                                    &path,
+                                    options,
+                                    &stop,
+                                    &mut progress,
+                                )?;
+                                let a = &report["augmentation"];
+                                let text = if a.is_object() {
+                                    format!(
+                                        "ZIP出力完了。加工 {} / {}枚（容量超過 {}枚、加工不可 {}枚）: {}",
+                                        a["added"],
+                                        a["requested"],
+                                        a["skipped_capacity"],
+                                        a["skipped_unavailable"],
+                                        path.display()
+                                    )
+                                } else {
+                                    format!("検査済みZIPを書き出しました: {}", path.display())
+                                };
+                                return Ok((project.take().unwrap(), text));
                             }
                             _ => unreachable!(),
                         };
@@ -342,13 +379,10 @@ impl Controller {
         } else {
             None
         };
-        let classes = match labeler_core::discover_classes(&root, labels.as_deref()) {
-            Ok(c) => c,
-            Err(e) => {
-                message(e.to_string());
-                return;
-            }
-        };
+        let classes = labeler_core::discover_classes(&root, labels.as_deref()).unwrap_or_else(|error| {
+            message(format!("classes.txtを読み込めませんでした。クラスを入力後、既存の画像ラベルTXTを使わずに追加できます。\n{error}"));
+            Vec::new()
+        });
         let Some(file) = rfd::FileDialog::new()
             .set_title("新規プロジェクトの保存先")
             .add_filter("YOLO Labeler Rust", &["ylp2"])
@@ -423,6 +457,10 @@ impl Controller {
             }
             state.dirty = true;
         }
+        let last_page = self.visible().len().div_ceil(10).saturating_sub(1);
+        if let Some(project) = &mut self.state.borrow_mut().project {
+            project.view.page = project.view.page.min(last_page);
+        }
         self.save();
         self.bump();
     }
@@ -453,11 +491,14 @@ impl Controller {
                             || s.duplicate_of.is_some()
                     }
                     _ => true,
-                }) && s
+                }) && (s
                     .origin_relative
                     .to_string_lossy()
                     .to_lowercase()
                     .contains(&search)
+                    || s.path.file_name().is_some_and(|name| {
+                        name.to_string_lossy().to_lowercase().contains(&search)
+                    }))
                     && (class == 0
                         || (class == usize::MAX && s.background)
                         || s.boxes
@@ -497,7 +538,22 @@ impl Controller {
                     )
             }),
             3 => v.sort_by_key(|&i| p.samples[i].duplicate_of.unwrap_or(p.samples[i].id)),
-            _ => v.sort_by(|&a, &b| sample_order(&p.samples[a], &p.samples[b])),
+            4 => v.sort_by(|&a, &b| sample_order(&p.samples[a], &p.samples[b])),
+            _ => {
+                // Samples are appended on import. The first occurrence records batch order
+                // even when filters hide every earlier sample in a batch.
+                let mut batch_order = HashMap::new();
+                for (index, sample) in p.samples.iter().enumerate() {
+                    batch_order.entry(sample.batch).or_insert(index);
+                }
+                v.sort_by(|&a, &b| {
+                    let a = &p.samples[a];
+                    let b = &p.samples[b];
+                    batch_order[&a.batch]
+                        .cmp(&batch_order[&b.batch])
+                        .then_with(|| sample_order(a, b))
+                });
+            }
         }
         v
     }
@@ -507,9 +563,13 @@ impl Controller {
         let Some(p) = &state.project else {
             return vec![];
         };
+        let page = p
+            .view
+            .page
+            .min(indices.len().div_ceil(10).saturating_sub(1));
         indices
             .into_iter()
-            .skip(p.view.page * 10)
+            .skip(page * 10)
             .take(10)
             .map(|i| p.samples[i].id)
             .collect()
@@ -527,12 +587,79 @@ impl Controller {
                 return;
             }
             p.view.page = page;
-            s.selection.clear();
         }
         self.save();
         self.bump();
         self.keyboard_focus.focus();
     }
+    fn stop_page_hold(&self, input: Option<&PageHold>) {
+        let mut active = self.page_hold.borrow_mut();
+        if active
+            .as_ref()
+            .is_some_and(|(source, _)| input.is_none_or(|input| source == input))
+        {
+            if let Some((_, alive)) = active.take() {
+                alive.set(false);
+            }
+        }
+    }
+
+    fn start_page_hold(&self, input: PageHold, delta: isize) {
+        self.stop_page_hold(None);
+        if !self.project_ready() {
+            return;
+        }
+        self.page(delta);
+        let alive = Rc::new(Cell::new(true));
+        *self.page_hold.borrow_mut() = Some((input, alive.clone()));
+        let start = std::time::Instant::now();
+        self.repeat_page_on_frame(
+            delta,
+            alive,
+            start,
+            start + std::time::Duration::from_millis(350),
+        );
+    }
+
+    fn repeat_page_on_frame(
+        &self,
+        delta: isize,
+        alive: Rc<Cell<bool>>,
+        start: std::time::Instant,
+        next: std::time::Instant,
+    ) {
+        use std::time::Duration;
+        let c = self.clone();
+        anti_webui::core::animation::request_frame(move |now| {
+            if !alive.get() {
+                return;
+            }
+            if !c.project_ready() {
+                c.stop_page_hold(None);
+                return;
+            }
+            let mut next = next;
+            if now >= next {
+                let before = c.state.borrow().project.as_ref().unwrap().view.page;
+                c.page(delta);
+                if c.state.borrow().project.as_ref().unwrap().view.page == before {
+                    c.stop_page_hold(None);
+                    return;
+                }
+                let elapsed = now.saturating_duration_since(start);
+                let delay = if elapsed >= Duration::from_secs(2) {
+                    45
+                } else if elapsed >= Duration::from_secs(1) {
+                    65
+                } else {
+                    110
+                };
+                next = now + Duration::from_millis(delay);
+            }
+            c.repeat_page_on_frame(delta, alive, start, next);
+        });
+    }
+
     fn toggle(&self, id: Uuid) {
         if !self.project_ready() {
             return;
@@ -555,12 +682,193 @@ impl Controller {
                     },
                 )
             });
-            let mut state = self.state.borrow_mut();
-            state.selection.clear();
-            state.selection.insert(id);
-            drop(state);
             self.keyboard_focus.focus();
         }
+    }
+    fn toggle_selection(&self, id: Uuid) {
+        if !self.project_ready() {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        if !state.selection.remove(&id) {
+            state.selection.insert(id);
+        }
+        drop(state);
+        self.bump();
+    }
+    fn toggle_page_selection(&self) {
+        if !self.project_ready() {
+            return;
+        }
+        let ids = self.page_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        if ids.iter().all(|id| state.selection.contains(id)) {
+            state.selection.retain(|id| !ids.contains(id));
+        } else {
+            state.selection.extend(ids);
+        }
+        drop(state);
+        self.bump();
+    }
+    fn clear_selection(&self) {
+        if self.project_ready() {
+            self.state.borrow_mut().selection.clear();
+            self.bump();
+        }
+    }
+    fn selected_ids(&self) -> Vec<Uuid> {
+        self.state.borrow().selection.iter().copied().collect()
+    }
+    fn mark_selected_background(&self) {
+        if !self.project_ready() {
+            return;
+        }
+        let ids = self.selected_ids();
+        if ids.is_empty() {
+            return;
+        }
+        if !confirm(&format!(
+            "選択した{}枚を背景にしますか？枠と候補が消えます。Ctrl+Zで戻せます。",
+            ids.len()
+        )) {
+            return;
+        }
+        self.state.borrow_mut().selection.clear();
+        self.mutate(|p, _| p.mark_background(&ids));
+        self.keyboard_focus.focus();
+    }
+    fn remove_selected(&self) {
+        if !self.project_ready() {
+            return;
+        }
+        let ids = self.selected_ids();
+        if ids.is_empty()
+            || !confirm(&format!(
+                "選択した{}枚をプロジェクトから削除しますか？元の画像とTXTは残ります。Ctrl+Zで戻せます。",
+                ids.len()
+            ))
+        {
+            return;
+        }
+        self.state.borrow_mut().selection.clear();
+        self.mutate(|p, _| {
+            p.remove_samples(&ids);
+        });
+        self.keyboard_focus.focus();
+    }
+    fn batch_class_dialog(&self, redetect: bool) {
+        if !self.project_ready() {
+            return;
+        }
+        let ids = self.selected_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let (classes, boxed_count) = {
+            let state = self.state.borrow();
+            let p = state.project.as_ref().unwrap();
+            let classes = (0..p.classes.len())
+                .map(|id| (id, p.display_class(id)))
+                .collect::<Vec<_>>();
+            let boxed_count = p
+                .samples
+                .iter()
+                .filter(|sample| state.selection.contains(&sample.id) && !sample.boxes.is_empty())
+                .count();
+            (classes, boxed_count)
+        };
+        if !redetect && boxed_count == 0 {
+            message("選択画像にクラスを変更できる枠がありません。");
+            return;
+        }
+        let c = self.clone();
+        let title = if redetect {
+            "大津法で枠を作り直す"
+        } else {
+            "枠のクラスを一括変更"
+        };
+        let detail = if redetect {
+            format!(
+                "選択した{}枚の既存枠と候補を消し、大津法で新しい枠を検出します。検出できなかった画像は要確認になります。",
+                ids.len()
+            )
+        } else {
+            format!(
+                "選択した{}枚のうち、枠のある{boxed_count}枚に適用します。枠の位置と大きさはそのままです。",
+                ids.len()
+            )
+        };
+        open_window(
+            WindowOptions {
+                title: title.into(),
+                width: 650,
+                height: 340,
+                modal: true,
+                dialog: true,
+                ..Default::default()
+            },
+            move || {
+                theme::follow_system();
+                let class = signal(0usize);
+                let c = c.clone();
+                let ids = ids.clone();
+                keyboard_surface(div())
+                    .flex()
+                    .flex_col()
+                    .gap(12_f32)
+                    .p(20_f32)
+                    .h_full()
+                    .overflow_y_scroll()
+                    .dyn_style(|s| s.bg(theme().page).text_color(theme().text))
+                    .child(heading(title))
+                    .child(text(detail.clone()))
+                    .child(text("適用するクラス"))
+                    .child(select(class, classes.clone()).on_key_down(|e| e.stop_propagation()))
+                    .child(text("Ctrl+Zで一括操作を戻せます。"))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(8_f32)
+                            .child(
+                                button(if redetect {
+                                    "枠を作り直す"
+                                } else {
+                                    "クラスを変更"
+                                })
+                                .on_click(move |_| {
+                                    if !c.project_ready() {
+                                        return;
+                                    }
+                                    if redetect {
+                                        c.job(Job::ReplaceBoxesWithOtsu(ids.clone(), class.get()));
+                                    } else {
+                                        let mut result = Ok(0);
+                                        c.mutate(|p, _| {
+                                            result = p.change_box_class(&ids, class.get());
+                                        });
+                                        if let Err(error) = result {
+                                            message(error.to_string());
+                                            return;
+                                        }
+                                        c.clear_selection();
+                                    }
+                                    close_window();
+                                }),
+                            )
+                            .child(button("キャンセル").on_click(|_| close_window())),
+                    )
+                    .on_key_down(|e| {
+                        if e.key == Key::Named(NamedKey::Escape) {
+                            close_window();
+                        }
+                        e.stop_propagation();
+                    })
+            },
+        );
     }
     fn wheel(&self, delta: f64) {
         if delta.abs() < 0.01 || !self.project_ready() {
@@ -671,6 +979,13 @@ impl Controller {
             sender.send(Event::Preview(request, result));
         });
     }
+    fn clear_filters(&self) {
+        batch(|| {
+            self.search.set(String::new());
+            self.filter.set(0);
+            self.class.set(0);
+        });
+    }
     fn preload(&self) {
         let visible = self.visible();
         let state = self.state.borrow();
@@ -683,7 +998,9 @@ impl Controller {
         {
             for &index in visible.iter().skip(current * 10).take(10) {
                 let sample = &p.samples[index];
-                if !state.cache.contains_key(&sample.id) {
+                if !state.cache.contains_key(&sample.id)
+                    && !state.thumbnail_errors.contains(&sample.id)
+                {
                     if let Ok(path) = p.image_path(sample) {
                         requests.push((sample.id, path, self.events.work()));
                     }
@@ -770,13 +1087,91 @@ impl Controller {
             message(errors.join("\n"));
             return;
         }
-        if let Some(p) = rfd::FileDialog::new()
-            .add_filter("V-Training ZIP", &["zip"])
-            .set_file_name("dataset.zip")
-            .save_file()
-        {
-            self.job(Job::Export(p));
-        }
+        let originals = self
+            .state
+            .borrow()
+            .project
+            .as_ref()
+            .unwrap()
+            .samples
+            .iter()
+            .filter(|sample| sample.decision == Decision::Keep)
+            .count();
+        let controller = self.clone();
+        open_window(
+            WindowOptions {
+                title: "学習用ZIPの出力".into(),
+                width: 620,
+                height: 660,
+                modal: true,
+                dialog: true,
+                ..Default::default()
+            },
+            move || {
+                theme::follow_system();
+                let enabled = signal(false);
+                let copies = signal(1u8);
+                let brightness = signal(true);
+                let contrast = signal(true);
+                let hue = signal(true);
+                let zoom_out = signal(true);
+                let crop = signal(true);
+                let rotate = signal(true);
+                let perspective = signal(true);
+                let blur = signal(true);
+                let noise = signal(true);
+
+                keyboard_surface(div()).flex().flex_col().gap(10_f32).p(20_f32)
+                .h_full().overflow_y_scroll()
+                .dyn_style(|s| s.bg(theme().page).text_color(theme().text))
+                .child(heading("V-Training ZIP"))
+                .child(checkbox(enabled, "加工画像を追加"))
+                .child(text(move || format!("元画像 {originals}枚 / 追加予定 {}枚",
+                    if enabled.get() { originals * usize::from(copies.get()) } else { 0 })))
+                .child(show(move || enabled.get(), move || {
+                    div().flex().flex_col().gap(6_f32)
+                        .child(text("元画像1枚あたりの加工枚数"))
+                        .child(select(copies, vec![(1, "1枚".into()), (2, "2枚".into()), (3, "3枚".into())]))
+                        .child(checkbox(brightness, "明るさ（±20%）"))
+                        .child(checkbox(contrast, "コントラスト（±20%）"))
+                        .child(checkbox(hue, "色相（色で分類する場合はオフ）"))
+                        .child(checkbox(zoom_out, "ズームアウト（余白を追加）"))
+                        .child(checkbox(crop, "ランダムクロップ"))
+                        .child(checkbox(perspective, "射影変換（台形・強さ0.1〜0.2）"))
+                        .child(checkbox(rotate, "回転（±45度以内）"))
+                        .child(checkbox(blur, "軽いぼかし"))
+                        .child(checkbox(noise, "軽いノイズ"))
+                        .child(text("200MBに収まる分だけ加工画像を追加します。元画像は全件含めます。"))
+                }))
+                .child(div().flex().flex_row().gap(8_f32)
+                    .child(button("保存先を選ぶ").on_click(move |_| {
+                        let options = if enabled.get() {
+                            let settings = labeler_core::AugmentOptions {
+                                copies:copies.get(), brightness:brightness.get(), contrast:contrast.get(),
+                                hue:hue.get(), zoom_out:zoom_out.get(), crop:crop.get(),
+                                rotate:rotate.get(), perspective:perspective.get(), blur:blur.get(), noise:noise.get()
+                            };
+                            if !settings.any_effect() {
+                                message("加工を1種類以上選んでください");
+                                return;
+                            }
+                            Some((settings, Uuid::new_v4().as_u128() as u64))
+                        } else { None };
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("V-Training ZIP", &["zip"])
+                            .set_file_name("dataset.zip").save_file()
+                        {
+                            controller.job(Job::Export(path, options));
+                            close_window();
+                        }
+                    }))
+                    .child(button("キャンセル (Esc)").on_click(|_| close_window())))
+                .on_key_down(|e| {
+                    if e.key == Key::Named(NamedKey::Escape) { close_window(); }
+                    e.stop_propagation();
+                })
+            },
+        );
     }
 }
 fn action(c: &Controller, label: &str, f: impl Fn(Controller) + 'static) -> Div {
@@ -791,6 +1186,35 @@ fn action(c: &Controller, label: &str, f: impl Fn(Controller) + 'static) -> Div 
             }
         })
 }
+fn page_button(c: &Controller, label: &str, delta: isize) -> Div {
+    use anti_webui::core::event::PointerButton;
+    let pressed = c.clone();
+    let released = c.clone();
+    let clicked = c.clone();
+    button(label.to_owned())
+        .on_click(move |e| {
+            if e.button.is_none() {
+                clicked.page(delta);
+            }
+        })
+        .on_key_down(|e| {
+            if !e.modifiers.ctrl && matches!(e.key, Key::Named(NamedKey::Enter | NamedKey::Space)) {
+                e.stop_propagation();
+            }
+        })
+        .on_pointer_down(move |e| {
+            if e.button == Some(PointerButton::Primary) {
+                pressed.start_page_hold(PageHold::Button(delta), delta);
+            }
+        })
+        .grab_threshold(0.)
+        .on_grab(move |e| {
+            if matches!(e.phase, GrabPhase::End | GrabPhase::Cancel) {
+                released.stop_page_hold(Some(&PageHold::Button(delta)));
+            }
+        })
+}
+
 fn thumbnail_card(c: Controller, s: Sample, number: usize) -> Div {
     let id = s.id;
     let mut state = c.state.borrow_mut();
@@ -818,7 +1242,15 @@ fn thumbnail_card(c: Controller, s: Sample, number: usize) -> Div {
     state.next_slot += 1;
     let token = state.next_slot;
     let slot = signal(bmp);
-    state.thumbnail_slots.insert(id, (token, slot));
+    let failed = signal(state.thumbnail_errors.contains(&id));
+    state.thumbnail_slots.insert(
+        id,
+        ThumbnailSlot {
+            token,
+            bitmap: slot,
+            failed,
+        },
+    );
     drop(state);
     let cleanup = c.state.clone();
     on_cleanup(move || {
@@ -826,11 +1258,13 @@ fn thumbnail_card(c: Controller, s: Sample, number: usize) -> Div {
         if state
             .thumbnail_slots
             .get(&id)
-            .is_some_and(|(current, _)| *current == token)
+            .is_some_and(|current| current.token == token)
         {
             state.thumbnail_slots.remove(&id);
         }
     });
+    let select = c.clone();
+    let selected = c.state.borrow().selection.contains(&id);
     let click = c.clone();
     let edit = c.clone();
     let excluded = s.decision == Decision::Exclude;
@@ -875,16 +1309,16 @@ fn thumbnail_card(c: Controller, s: Sample, number: usize) -> Div {
             text(format!(
                 "{}  {}",
                 (number + 1) % 10,
-                s.origin_relative
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
+                s.path.file_name().unwrap_or_default().to_string_lossy()
             ))
             .text_size(13_f32)
             .max_h(20.)
             .overflow_hidden(),
         )
         .child(dyn_view(move || {
+            if failed.get() {
+                return div().h(image_height).child(text("画像を読み込めません"));
+            }
             editor::preview_sized(
                 slot.get(),
                 boxes.clone(),
@@ -913,6 +1347,12 @@ fn thumbnail_card(c: Controller, s: Sample, number: usize) -> Div {
                 .overflow_hidden()
                 .into_view()
         })
+        .child(
+            button(if selected { "✓ 選択中" } else { "選択" }).on_click(move |e| {
+                e.stop_propagation();
+                select.toggle_selection(id);
+            }),
+        )
         .child(button("枠を編集").on_click(move |e| {
             e.stop_propagation();
             edit.edit_sample(id);
@@ -959,6 +1399,18 @@ fn grid(c: Controller) -> Div {
         "{filename}  · 全{total}枚 / 採用{kept}枚  · {} / {pages}ページ",
         page + 1
     )));
+    if samples.is_empty() {
+        return if total == 0 {
+            body.child(text(
+                "このプロジェクトには画像がありません。「画像を追加」から取り込めます。",
+            ))
+        } else {
+            body.child(text("検索・絞り込みに一致する画像がありません。"))
+                .child(action(&c, "検索・絞り込みを解除", |c| {
+                    c.clear_filters()
+                }))
+        };
+    }
     for row in 0..2 {
         body = body.child(
             div().flex().flex_row().gap(8_f32).children(
@@ -1151,6 +1603,7 @@ fn app_with(project: Option<Project>, qa_theme: Option<bool>, qa_edit: bool) -> 
     }));
     let version = signal(0u64);
     let status = signal(initial_status.to_owned());
+    let job_error = signal(None::<String>);
     let busy = signal(false);
     let editing = signal(initial_edit.is_some());
     let edit: Signal<Option<editor::Edit>> = signal(initial_edit);
@@ -1239,7 +1692,7 @@ fn app_with(project: Option<Project>, qa_theme: Option<bool>, qa_edit: bool) -> 
                     s.cache.clear();
                     s.lru.clear();
                     s.cache_bytes = 0;
-                    s.loading.clear();
+                    s.thumbnail_errors.clear();
                     s.dirty = unsaved;
                     drop(s);
                     batch(|| {
@@ -1252,7 +1705,10 @@ fn app_with(project: Option<Project>, qa_theme: Option<bool>, qa_edit: bool) -> 
                         version.update(|v| *v += 1);
                     });
                 }
-                Err(e) => status.set(format!("処理を完了できませんでした: {e:#}")),
+                Err(e) => {
+                    status.set("処理を完了できませんでした".into());
+                    job_error.set(Some(format!("{e:#}")));
+                }
             }
         }
         Event::Thumbnail(id, result) => {
@@ -1264,7 +1720,10 @@ fn app_with(project: Option<Project>, qa_theme: Option<bool>, qa_edit: bool) -> 
             {
                 return;
             }
-            let slot = s.thumbnail_slots.get(&id).map(|(_, slot)| *slot);
+            let slot = s
+                .thumbnail_slots
+                .get(&id)
+                .map(|slot| (slot.bitmap, slot.failed));
             if let Ok(rgba) = result {
                 let bytes = rgba.len();
                 if let Some(old) = s.cache.remove(&id) {
@@ -1286,8 +1745,15 @@ fn app_with(project: Option<Project>, qa_theme: Option<bool>, qa_edit: bool) -> 
                 s.lru.push_back(id);
                 s.cache.insert(id, bitmap.clone());
                 drop(s);
-                if let Some(slot) = slot {
+                if let Some((slot, failed)) = slot {
+                    failed.set(false);
                     slot.set(Some(bitmap));
+                }
+            } else {
+                s.thumbnail_errors.insert(id);
+                drop(s);
+                if let Some((_, failed)) = slot {
+                    failed.set(true);
                 }
             }
         }
@@ -1313,6 +1779,7 @@ fn app_with(project: Option<Project>, qa_theme: Option<bool>, qa_edit: bool) -> 
         state,
         version,
         status,
+        job_error,
         busy,
         search,
         filter,
@@ -1321,6 +1788,7 @@ fn app_with(project: Option<Project>, qa_theme: Option<bool>, qa_edit: bool) -> 
         crop,
         viewport,
         keyboard_focus: keyboard_root,
+        page_hold: Rc::default(),
         edit,
         editing,
         preview,
@@ -1344,6 +1812,13 @@ fn app_with(project: Option<Project>, qa_theme: Option<bool>, qa_edit: bool) -> 
     if needs_save && qa_theme.is_none() {
         c.save();
     }
+    let hold = c.clone();
+    effect(move || {
+        if !window_active() || !hold.allowed() {
+            hold.stop_page_hold(None);
+        }
+    });
+    let release_key = c.clone();
     let filters = c.clone();
     effect(move || {
         let (q, f, k, o, r) = (
@@ -1407,6 +1882,7 @@ fn app_with(project: Option<Project>, qa_theme: Option<bool>, qa_edit: bool) -> 
     let editor_c = c.clone();
     let keyboard = c.clone();
     let pager = c.clone();
+    let bulk = c.clone();
     let wheel = c.clone();
     let footer = c.clone();
     let cancel_job = c.clone();
@@ -1509,10 +1985,11 @@ fn app_with(project: Option<Project>, qa_theme: Option<bool>, qa_edit: bool) -> 
                     select(
                         sort,
                         [
-                            "ファイル名順（数字順）",
+                            "追加順（各回は数字順）",
                             "品質候補順",
                             "ぼけ指標順",
                             "完全重複順",
+                            "全体のファイル名順（数字順）",
                         ]
                         .iter()
                         .enumerate()
@@ -1523,6 +2000,65 @@ fn app_with(project: Option<Project>, qa_theme: Option<bool>, qa_edit: bool) -> 
                 )
                 .child(checkbox(crop, "対象を拡大")),
         )
+        .child(dyn_view(move || {
+            bulk.version.get();
+            if !bulk.project_ready() {
+                return div();
+            }
+            let ids = bulk.page_ids();
+            let state = bulk.state.borrow();
+            let count = state.selection.len();
+            let page_selected =
+                !ids.is_empty() && ids.iter().all(|id| state.selection.contains(id));
+            drop(state);
+            let mut row = div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(6_f32)
+                .items_center();
+            if !ids.is_empty() {
+                row = row.child(action(
+                    &bulk,
+                    if page_selected {
+                        "このページの選択を解除"
+                    } else {
+                        "このページを全選択"
+                    },
+                    |c| c.toggle_page_selection(),
+                ));
+            }
+            if count > 0 {
+                row = row
+                    .child(text(format!("{count}枚選択中")))
+                    .child(action(&bulk, "背景に設定", |c| {
+                        c.mark_selected_background()
+                    }))
+                    .child(action(&bulk, "クラス変更…", |c| {
+                        c.batch_class_dialog(false)
+                    }))
+                    .child(action(&bulk, "枠削除＋大津法…", |c| {
+                        c.batch_class_dialog(true)
+                    }))
+                    .child(action(&bulk, "画像を削除…", |c| c.remove_selected()))
+                    .child(action(&bulk, "選択をすべて解除", |c| {
+                        c.clear_selection()
+                    }));
+            }
+            row
+        }))
+        .child(dyn_view(move || {
+            if let Some(error) = job_error.get() {
+                div()
+                    .p(8_f32)
+                    .rounded(6_f32)
+                    .dyn_style(|s| s.bg(theme().surface).text_color(theme().danger))
+                    .child(text(error))
+                    .child(button("閉じる").on_click(move |_| job_error.set(None)))
+            } else {
+                div()
+            }
+        }))
         .child(
             div()
                 .flex_1()
@@ -1552,7 +2088,7 @@ fn app_with(project: Option<Project>, qa_theme: Option<bool>, qa_edit: bool) -> 
                 .flex_row()
                 .gap(10_f32)
                 .items_center()
-                .child(action(&c, "← 前へ (A)", |c| c.page(-1)))
+                .child(page_button(&c, "← 前へ (A)", -1))
                 .child(dyn_view(move || {
                     pager.version.get();
                     let state = pager.state.borrow();
@@ -1563,7 +2099,7 @@ fn app_with(project: Option<Project>, qa_theme: Option<bool>, qa_edit: bool) -> 
                         pager.visible().len().div_ceil(10).max(1)
                     ))
                 }))
-                .child(action(&c, "次へ (D) →", |c| c.page(1)))
+                .child(page_button(&c, "次へ (D) →", 1))
                 .child(action(&c, "保存 (Ctrl+S)", |c| {
                     if c.editing.get() {
                         editor::save_current(c);
@@ -1598,7 +2134,42 @@ fn app_with(project: Option<Project>, qa_theme: Option<bool>, qa_edit: bool) -> 
             })
             .text_size(12_f32),
         )
+        .on_key_up(move |e| {
+            let key = match &e.key {
+                Key::Character(value) => Key::Character(value.to_ascii_lowercase()),
+                key => key.clone(),
+            };
+            release_key.stop_page_hold(Some(&PageHold::Key(key)));
+        })
         .on_key_down(move |e| {
+            let direction = match &e.key {
+                Key::Named(NamedKey::ArrowLeft) => Some(-1),
+                Key::Named(NamedKey::ArrowRight) => Some(1),
+                key if key.is_char('a') => Some(-1),
+                key if key.is_char('d') => Some(1),
+                _ => None,
+            };
+            if let Some(delta) = direction {
+                if keyboard.allowed()
+                    && !e.is_default_prevented()
+                    && !e.modifiers.ctrl
+                    && !e.modifiers.alt
+                    && !e.modifiers.logo
+                {
+                    if !e.repeat {
+                        let key = match &e.key {
+                            Key::Character(value) => Key::Character(value.to_ascii_lowercase()),
+                            key => key.clone(),
+                        };
+                        keyboard.start_page_hold(PageHold::Key(key), delta);
+                    }
+                    e.prevent_default();
+                    return;
+                }
+            }
+            if !e.repeat {
+                keyboard.stop_page_hold(None);
+            }
             if e.key == Key::Named(NamedKey::F(1)) {
                 e.prevent_default();
                 help::open();
@@ -1632,10 +2203,7 @@ fn app_with(project: Option<Project>, qa_theme: Option<bool>, qa_edit: bool) -> 
                 return;
             }
             match &e.key {
-                Key::Named(NamedKey::ArrowLeft) => keyboard.page(-1),
-                Key::Named(NamedKey::ArrowRight | NamedKey::Enter) => keyboard.page(1),
-                key if key.is_char('a') => keyboard.page(-1),
-                key if key.is_char('d') => keyboard.page(1),
+                Key::Named(NamedKey::Enter) => keyboard.page(1),
                 Key::Character(s) if s.len() == 1 && "1234567890".contains(s.as_str()) => {
                     if let Some(id) = keyboard
                         .page_ids()

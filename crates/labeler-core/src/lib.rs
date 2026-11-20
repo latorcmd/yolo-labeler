@@ -1,5 +1,6 @@
 //! GUI-independent, non-destructive project operations.
 use anyhow::{Context, Result, ensure};
+pub use labeler_vision::augment::AugmentOptions;
 pub use labeler_vision::{DetectorConfig, NormalizedBox, Quality};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,6 +17,7 @@ use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 pub const MIN_IMAGES: usize = 101;
 pub const MAX_ZIP_BYTES: u64 = 200_000_000;
 const EPS: f64 = 1e-6;
+const REMOVE_SAMPLES_ACTION: &str = "一括削除";
 pub type Progress<'a> = &'a mut dyn FnMut(usize, usize);
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -26,9 +28,17 @@ pub enum DecisionOrigin {
     Manual,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImportLabelSource {
+    #[default]
+    Existing,
+    Otsu,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ImportOptions {
     pub background: bool,
+    pub label_source: ImportLabelSource,
     pub fixed_class: usize,
     pub ranges: Option<PathBuf>,
     pub detector: DetectorConfig,
@@ -130,7 +140,7 @@ pub struct Project {
     #[serde(skip)]
     pub file: PathBuf,
     #[serde(skip)]
-    pub undo: VecDeque<Vec<Sample>>,
+    pub undo: VecDeque<Vec<(usize, Sample)>>,
     #[serde(skip)]
     pub revision: u64,
     #[serde(skip)]
@@ -543,16 +553,14 @@ impl Project {
         tmp.persist(&self.file).map_err(|e| e.error)?;
         let journals = self.assets().join("transactions");
         if journals.exists() {
+            let registered = self.registered_sample_ids();
             for e in fs::read_dir(journals)? {
                 let path = e?.path();
                 if path.extension().is_some_and(|s| s == "json") {
                     if let Ok(samples) = fs::read(&path).and_then(|b| {
                         serde_json::from_slice::<Vec<Sample>>(&b).map_err(std::io::Error::other)
                     }) {
-                        if samples
-                            .iter()
-                            .all(|s| self.samples.iter().any(|x| x.id == s.id))
-                        {
+                        if samples.iter().all(|s| registered.contains(&s.id)) {
                             fs::remove_file(path)?;
                         }
                     }
@@ -561,11 +569,24 @@ impl Project {
         }
         Ok(())
     }
+    fn registered_sample_ids(&self) -> HashSet<Uuid> {
+        self.samples
+            .iter()
+            .map(|s| s.id)
+            .chain(
+                self.audit
+                    .iter()
+                    .filter(|a| a.action == REMOVE_SAMPLES_ACTION)
+                    .flat_map(|a| a.samples.iter().copied()),
+            )
+            .collect()
+    }
     fn recover_imports(&mut self) -> Result<()> {
         let transactions = self.assets().join("transactions");
         if !transactions.exists() {
             return Ok(());
         }
+        let mut registered = self.registered_sample_ids();
         for e in fs::read_dir(transactions)? {
             let path = e?.path();
             if path.extension().is_none_or(|s| s != "json") {
@@ -573,7 +594,8 @@ impl Project {
             }
             let samples: Vec<Sample> = serde_json::from_slice(&fs::read(&path)?)?;
             for s in samples {
-                if !self.samples.iter().any(|x| x.id == s.id) && self.image_path(&s)?.is_file() {
+                if !registered.contains(&s.id) && self.image_path(&s)?.is_file() {
+                    registered.insert(s.id);
                     self.samples.push(s);
                     self.needs_save = true;
                     self.warnings
@@ -620,11 +642,15 @@ impl Project {
             .and_then(Path::parent)
             .unwrap_or(&root)
             .to_path_buf();
-        let classes = discover_classes(&root, labels)?;
-        ensure!(
-            classes.is_empty() || classes == self.classes,
-            "追加元の classes.txt の順序・名称が一致しません"
-        );
+        let use_existing_labels =
+            !options.is_some_and(|o| o.label_source == ImportLabelSource::Otsu);
+        if use_existing_labels {
+            let classes = discover_classes(&root, labels)?;
+            ensure!(
+                classes.is_empty() || classes == self.classes,
+                "追加元の classes.txt の順序・名称が一致しません"
+            );
+        }
         let ranges = if let Some(options) = options.filter(|o| !o.background) {
             ensure!(
                 options.fixed_class < self.classes.len(),
@@ -638,7 +664,7 @@ impl Project {
         } else {
             None
         };
-        if options.is_some_and(|o| o.background) {
+        if use_existing_labels && options.is_some_and(|o| o.background) {
             let mut conflicts = vec![];
             for path in paths {
                 cancelled(cancel)?;
@@ -686,6 +712,12 @@ impl Project {
             .iter()
             .map(|s| s.origin_root.join(&s.origin_relative))
             .collect::<HashSet<_>>();
+        let mut used_stems = self
+            .samples
+            .iter()
+            .filter_map(|s| s.path.file_stem())
+            .map(|stem| stem.to_string_lossy().to_lowercase())
+            .collect::<HashSet<_>>();
         let mut added = vec![];
         for (i, path) in paths.iter().enumerate() {
             cancelled(cancel)?;
@@ -702,16 +734,40 @@ impl Project {
             }
             let rel = original.strip_prefix(&root)?.to_path_buf();
             let id = Uuid::new_v4();
-            let local = PathBuf::from(id.to_string()).join(original.file_name().unwrap());
+            let stem = original
+                .file_stem()
+                .context("画像名不正")?
+                .to_string_lossy();
+            let mut unique_stem = stem.to_string();
+            let mut suffix = 2;
+            while !used_stems.insert(unique_stem.to_lowercase()) {
+                unique_stem = format!("{stem}_{suffix}");
+                suffix += 1;
+            }
+            let name = if unique_stem == stem {
+                original.file_name().context("画像名不正")?.to_os_string()
+            } else {
+                let extension = original.extension().context("画像形式不正")?;
+                let mut name = std::ffi::OsString::from(unique_stem);
+                name.push(".");
+                name.push(extension);
+                name
+            };
+            let local = PathBuf::from(id.to_string()).join(name);
             let target = stage.path().join(&local);
             fs::create_dir_all(target.parent().unwrap())?;
             fs::copy(&original, &target)?;
             let payload = fs::read(&target)?;
-            let (width, height, image_error) = match image::load_from_memory(&payload) {
+            let image = image::load_from_memory(&payload);
+            let (width, height, image_error) = match &image {
                 Ok(im) => (im.width(), im.height(), None),
                 Err(e) => (0, 0, Some(e.to_string())),
             };
-            let label = label_path(&root, &rel, labels);
+            let label = if use_existing_labels {
+                label_path(&root, &rel, labels)
+            } else {
+                None
+            };
             let mut has_label = label.is_some();
             let (mut boxes, mut label_errors) = if let Some(l) = label {
                 fs::copy(&l, target.with_extension("txt"))?;
@@ -725,7 +781,7 @@ impl Project {
             let mut background = has_label && boxes.is_empty() && label_errors.is_empty();
             let mut automatic_label = false;
             if let Some(options) = options {
-                if image_error.is_none() {
+                if let Ok(image) = &image {
                     if options.background {
                         boxes.clear();
                         label_errors.clear();
@@ -739,9 +795,14 @@ impl Project {
                         } else {
                             options.fixed_class
                         };
-                        let detected = image::load_from_memory(&payload)
-                            .map_err(anyhow::Error::from)
-                            .and_then(|im| labeler_vision::detect(&im, &options.detector));
+                        let detected = match options.label_source {
+                            ImportLabelSource::Existing => {
+                                labeler_vision::detect(image, &options.detector)
+                            }
+                            ImportLabelSource::Otsu => {
+                                labeler_vision::detect_otsu(image, &options.detector)
+                            }
+                        };
                         cancelled(cancel)?;
                         match detected {
                             Ok(mut detection) if !detection.boxes.is_empty() => {
@@ -836,13 +897,15 @@ impl Project {
         });
     }
     pub fn checkpoint(&mut self, ids: &[Uuid]) {
-        self.undo.push_back(
-            self.samples
-                .iter()
-                .filter(|s| ids.contains(&s.id))
-                .cloned()
-                .collect(),
-        );
+        let selected = ids.iter().copied().collect::<HashSet<_>>();
+        let snapshot = self
+            .samples
+            .iter()
+            .enumerate()
+            .filter(|(_, sample)| selected.contains(&sample.id))
+            .map(|(index, sample)| (index, sample.clone()))
+            .collect();
+        self.undo.push_back(snapshot);
         while self.undo.len() > 40 {
             self.undo.pop_front();
         }
@@ -851,10 +914,14 @@ impl Project {
         let Some(snapshot) = self.undo.pop_back() else {
             return false;
         };
-        let ids = snapshot.iter().map(|s| s.id).collect();
-        for before in snapshot {
-            if let Some(s) = self.samples.iter_mut().find(|s| s.id == before.id) {
-                *s = before;
+        let ids = snapshot.iter().map(|(_, sample)| sample.id).collect();
+        // Edits keep sample order, and imports append. Restore deleted rows
+        // in ascending index order so each row returns to its previous slot.
+        for (index, before) in snapshot {
+            if let Some(sample) = self.samples.get_mut(index).filter(|s| s.id == before.id) {
+                *sample = before;
+            } else {
+                self.samples.insert(index, before);
             }
         }
         self.log("Undo", ids);
@@ -918,6 +985,17 @@ impl Project {
             .iter_mut()
             .find(|s| s.id == id)
             .context("画像がありません")?;
+        Self::apply_label_edit(s, boxes, decision, negative, "編集画面で確認");
+        self.log("枠編集", vec![id]);
+        Ok(())
+    }
+    fn apply_label_edit(
+        s: &mut Sample,
+        boxes: Vec<NormalizedBox>,
+        decision: Decision,
+        negative: bool,
+        reason: &str,
+    ) {
         s.boxes = boxes;
         s.has_label = true;
         s.background = s.boxes.is_empty() && negative;
@@ -926,13 +1004,153 @@ impl Project {
         s.label_errors.clear();
         s.proposals.clear();
         s.proposal_pending = false;
+        s.proposal_info = serde_json::Value::Null;
         s.reviewed = true;
         s.decision = decision;
-        s.reason = "編集画面で確認".into();
+        s.reason = reason.into();
         s.quality = None;
-        self.log("枠編集", vec![id]);
-        Ok(())
     }
+
+    pub fn mark_background(&mut self, ids: &[Uuid]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.checkpoint(ids);
+        for s in &mut self.samples {
+            if ids.contains(&s.id) {
+                let decision = match s.decision {
+                    Decision::Exclude | Decision::Hold => s.decision,
+                    _ if s.image_error.is_some() => Decision::Fix,
+                    _ => Decision::Keep,
+                };
+                Self::apply_label_edit(s, Vec::new(), decision, true, "一括で背景に設定");
+            }
+        }
+        self.log("一括で背景に設定", ids.to_vec());
+    }
+
+    pub fn change_box_class(&mut self, ids: &[Uuid], class_id: usize) -> Result<usize> {
+        ensure!(class_id < self.classes.len(), "クラスIDが範囲外です");
+        let selected = ids.iter().copied().collect::<HashSet<_>>();
+        let changed = self
+            .samples
+            .iter()
+            .filter(|sample| {
+                selected.contains(&sample.id)
+                    && sample.boxes.iter().any(|bbox| bbox.class_id != class_id)
+            })
+            .map(|sample| sample.id)
+            .collect::<Vec<_>>();
+        if changed.is_empty() {
+            return Ok(0);
+        }
+        self.checkpoint(&changed);
+        for sample in self.samples.iter_mut().filter(|s| selected.contains(&s.id)) {
+            for bbox in &mut sample.boxes {
+                bbox.class_id = class_id;
+            }
+        }
+        let count = changed.len();
+        self.log("枠のクラスを一括変更", changed);
+        Ok(count)
+    }
+
+    pub fn remove_samples(&mut self, ids: &[Uuid]) -> usize {
+        let selected = ids.iter().copied().collect::<HashSet<_>>();
+        let removed = self
+            .samples
+            .iter()
+            .filter(|s| selected.contains(&s.id))
+            .map(|s| s.id)
+            .collect::<Vec<_>>();
+        if removed.is_empty() {
+            return 0;
+        }
+        self.checkpoint(&removed);
+        self.samples.retain(|s| !selected.contains(&s.id));
+        let count = removed.len();
+        self.log(REMOVE_SAMPLES_ACTION, removed);
+        count
+    }
+
+    pub fn replace_boxes_with_otsu(
+        &mut self,
+        ids: &[Uuid],
+        class_id: usize,
+        cancel: &AtomicBool,
+        progress: Progress<'_>,
+    ) -> Result<(usize, usize)> {
+        ensure!(class_id < self.classes.len(), "クラスIDが範囲外です");
+        let selected = ids.iter().copied().collect::<HashSet<_>>();
+        let samples = self
+            .samples
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| selected.contains(&s.id))
+            .collect::<Vec<_>>();
+        let config = DetectorConfig::default();
+        let mut results = Vec::with_capacity(samples.len());
+        for (i, (index, sample)) in samples.iter().enumerate() {
+            cancelled(cancel)?;
+            let result = (|| -> Result<_> {
+                let image = image::open(self.image_path(sample)?)?;
+                let mut detection = labeler_vision::detect_otsu(&image, &config)?;
+                ensure!(
+                    !detection.boxes.is_empty(),
+                    "対象の枠を検出できませんでした。枠を編集してください"
+                );
+                for bbox in &mut detection.boxes {
+                    bbox.class_id = class_id;
+                }
+                Ok(detection.boxes)
+            })();
+            results.push((*index, sample.id, result));
+            progress(i + 1, samples.len());
+        }
+        cancelled(cancel)?;
+        if results.is_empty() {
+            return Ok((0, 0));
+        }
+        let changed = results.iter().map(|(_, id, _)| *id).collect::<Vec<_>>();
+        self.checkpoint(&changed);
+        let mut detected = 0;
+        let mut failed = 0;
+        for (index, _, result) in results {
+            let sample = &mut self.samples[index];
+            let (boxes, error) = match result {
+                Ok(boxes) => {
+                    detected += 1;
+                    (boxes, None)
+                }
+                Err(error) => {
+                    failed += 1;
+                    (Vec::new(), Some(error.to_string()))
+                }
+            };
+            let preserved = matches!(sample.decision, Decision::Exclude | Decision::Hold);
+            let origin = sample.decision_origin;
+            let decision = if preserved {
+                sample.decision
+            } else if error.is_some() || sample.image_error.is_some() {
+                Decision::Fix
+            } else {
+                Decision::Keep
+            };
+            Self::apply_label_edit(sample, boxes, decision, false, "大津法で枠を一括再検出");
+            sample.automatic_label = error.is_none();
+            sample.has_label = error.is_none();
+            sample.reviewed = false;
+            sample.decision_origin = if preserved {
+                origin
+            } else {
+                DecisionOrigin::AutoDefault
+            };
+            sample.label_errors.extend(error);
+        }
+        self.log("大津法で枠を一括再検出", changed);
+        Ok((detected, failed))
+    }
+
     pub fn set_classes(&mut self, classes: Vec<String>) -> Result<()> {
         validate_classes(&classes)?;
         ensure!(
@@ -1243,6 +1461,34 @@ impl Project {
         cancel: &AtomicBool,
         progress: Progress<'_>,
     ) -> Result<serde_json::Value> {
+        self.export_with_augmentation(destination, None, cancel, progress)
+    }
+
+    pub fn export_with_augmentation(
+        &self,
+        destination: &Path,
+        augmentation: Option<(labeler_vision::augment::AugmentOptions, u64)>,
+        cancel: &AtomicBool,
+        progress: Progress<'_>,
+    ) -> Result<serde_json::Value> {
+        self.export_with_limit(destination, augmentation, MAX_ZIP_BYTES, cancel, progress)
+    }
+
+    fn export_with_limit(
+        &self,
+        destination: &Path,
+        augmentation: Option<(labeler_vision::augment::AugmentOptions, u64)>,
+        limit: u64,
+        cancel: &AtomicBool,
+        progress: Progress<'_>,
+    ) -> Result<serde_json::Value> {
+        use rand::{RngExt, SeedableRng, rngs::StdRng, seq::SliceRandom};
+        if let Some((options, _)) = augmentation {
+            ensure!(
+                (1..=3).contains(&options.copies) && options.any_effect(),
+                "加工枚数は1〜3枚にし、加工を1種類以上選んでください"
+            );
+        }
         let errors = self.validate_export();
         ensure!(errors.is_empty(), "{}", errors.join("\n"));
         ensure!(
@@ -1272,19 +1518,11 @@ impl Project {
             .filter(|s| s.decision == Decision::Keep)
             .collect::<Vec<_>>();
         let mut mapping = vec![];
+        let planned = augmentation.map_or(0, |(o, _)| accepted.len() * usize::from(o.copies));
+        let total = accepted.len() + planned;
         for (i, s) in accepted.iter().enumerate() {
             cancelled(cancel)?;
-            let bytes = fs::read(self.image_path(s)?)?;
-            ensure!(
-                hash(&bytes) == s.source_hash,
-                "元画像が変更されています: {}",
-                s.origin_relative.display()
-            );
-            let image = image::load_from_memory(&bytes)?.to_rgb8();
-            ensure!(
-                image.dimensions() == (s.width, s.height),
-                "画像寸法が変わっています"
-            );
+            let image = self.read_export_image(s)?;
             let mut jpeg = vec![];
             image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
                 .encode_image(&image)?;
@@ -1294,12 +1532,123 @@ impl Project {
             zip.start_file(format!("{name}.txt"), options)?;
             zip.write_all(yolo_text(&s.boxes).as_bytes())?;
             mapping.push(serde_json::json!({"output":name,"id":s.id,"origin_root":s.origin_root,"origin_relative":s.origin_relative,"sha256":s.source_hash}));
-            progress(i + 1, accepted.len());
+            progress(i + 1, total);
         }
         zip.finish()?.sync_all()?;
+        cancelled(cancel)?;
+        let mut size = fs::metadata(tmp.path())?.len();
+        ensure!(size <= limit, "元画像だけでZIPの容量上限を超えています");
+        let mut augmentation_report = None;
+        let mut merged = None;
+        if let Some((settings, seed)) = augmentation {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut order: Vec<_> = (0..accepted.len()).collect();
+            let mut skipped = Vec::new();
+            let mut by_capacity = 0;
+            let mut unavailable = 0;
+            let mut done = accepted.len();
+            let mut append = None;
+            // Stored entries have fixed local/central headers and no compression overhead.
+            // Leave room for the ZIP64 end records if the entry count crosses the ZIP32 limit.
+            let stored =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            let mut entries = 2 + accepted.len() * 2;
+            for round in 1..=settings.copies {
+                order.shuffle(&mut rng);
+                for &index in &order {
+                    cancelled(cancel)?;
+                    let s = accepted[index];
+                    let candidate_seed: u64 = rng.random();
+                    let mut reason = "容量上限";
+                    let mut applied = None;
+                    let name = format!("{:06}", mapping.len() + 1);
+                    let overhead = 2 * (30 + 46 + 2 * (name.len() as u64 + 4));
+                    let zip64 = if entries < 65535 && entries + 2 >= 65535 {
+                        128
+                    } else {
+                        0
+                    };
+                    if size + overhead + zip64 < limit {
+                        let source = self.read_export_image(s)?;
+                        let (candidate, effects) = labeler_vision::augment::generate(
+                            &source,
+                            &s.boxes,
+                            settings,
+                            candidate_seed,
+                        );
+                        applied = Some(effects);
+                        if let Some((image, boxes)) = candidate {
+                            for b in &boxes {
+                                validate_box(b, self.classes.len())?;
+                            }
+                            let mut jpeg = Vec::new();
+                            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
+                                .encode_image(&image)?;
+                            let label = yolo_text(&boxes);
+                            let cost = overhead + zip64 + jpeg.len() as u64 + label.len() as u64;
+                            if size + cost <= limit {
+                                cancelled(cancel)?;
+                                if append.is_none() {
+                                    // Copy the existing local entries without their old central directory.
+                                    let output = tempfile::NamedTempFile::new_in(parent)?;
+                                    let mut writer = ZipWriter::new(output.reopen()?);
+                                    writer.merge_archive(ZipArchive::new(tmp.reopen()?)?)?;
+                                    merged = Some(output);
+                                    append = Some(writer);
+                                }
+                                let zip = append.as_mut().unwrap();
+                                zip.start_file(format!("{name}.jpg"), stored)?;
+                                zip.write_all(&jpeg)?;
+                                zip.start_file(format!("{name}.txt"), stored)?;
+                                zip.write_all(label.as_bytes())?;
+                                size += cost;
+                                entries += 2;
+                                mapping.push(serde_json::json!({
+                                    "output":name,"id":s.id,"origin_root":s.origin_root,
+                                    "origin_relative":s.origin_relative,"sha256":s.source_hash,
+                                    "augmentation":{"copy":round,"seed":candidate_seed,"applied":effects}
+                                }));
+                                done += 1;
+                                progress(done, total);
+                                continue;
+                            }
+                        } else {
+                            reason = "安全に適用できる加工なし";
+                        }
+                    }
+                    if reason == "容量上限" {
+                        by_capacity += 1;
+                    } else {
+                        unavailable += 1;
+                    }
+                    skipped.push(
+                        serde_json::json!({"id":s.id,"copy":round,"seed":candidate_seed,
+                        "reason":reason,"applied":applied}),
+                    );
+                    done += 1;
+                    progress(done, total);
+                }
+            }
+            if let Some(zip) = append {
+                zip.finish()?.sync_all()?;
+            }
+            augmentation_report = Some(serde_json::json!({
+                "seed":seed,"settings":settings,"requested":planned,"added":mapping.len()-accepted.len(),
+                "skipped_capacity":by_capacity,"skipped_unavailable":unavailable,"skipped":skipped
+            }));
+        }
+        let tmp = merged.unwrap_or(tmp);
+        ensure!(
+            fs::metadata(tmp.path())?.len() <= limit,
+            "完成ZIPが容量上限を超えています"
+        );
+        cancelled(cancel)?;
         let summary = inspect_zip(tmp.path())?;
         cancelled(cancel)?;
-        let report = serde_json::json!({"format":"V-Training Detection","created_utc_seconds":now(),"summary":summary,"mapping":mapping,"warnings":self.warnings});
+        let mut report = serde_json::json!({"format":"V-Training Detection","created_utc_seconds":now(),"summary":summary,"mapping":mapping,"warnings":self.warnings});
+        if let Some(metadata) = augmentation_report {
+            report["augmentation"] = metadata;
+        }
         let mut rt = tempfile::NamedTempFile::new_in(parent)?;
         serde_json::to_writer_pretty(&mut rt, &report)?;
         rt.as_file().sync_all()?;
@@ -1310,6 +1659,20 @@ impl Project {
             return Err(e.error.into());
         }
         Ok(report)
+    }
+    fn read_export_image(&self, sample: &Sample) -> Result<image::RgbImage> {
+        let bytes = fs::read(self.image_path(sample)?)?;
+        ensure!(
+            hash(&bytes) == sample.source_hash,
+            "元画像が変更されています: {}",
+            sample.origin_relative.display()
+        );
+        let image = image::load_from_memory(&bytes)?.to_rgb8();
+        ensure!(
+            image.dimensions() == (sample.width, sample.height),
+            "画像寸法が変わっています"
+        );
+        Ok(image)
     }
 }
 pub fn inspect_zip(path: &Path) -> Result<serde_json::Value> {
@@ -1419,4 +1782,71 @@ pub fn class_from_ranges(path: &Path, ranges: &[ClassRange]) -> Result<usize> {
         .find(|r| r.start <= n && n <= r.end)
         .map(|r| r.class_id)
         .context("CSVに対応する範囲がありません")
+}
+
+#[cfg(test)]
+mod augmentation_export_tests {
+    use super::*;
+
+    #[test]
+    fn export_keeps_originals_reproduces_copies_and_respects_budget() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("images");
+        fs::create_dir(&source)?;
+        let mut inputs = Vec::new();
+        for i in 0..MIN_IMAGES {
+            let file = source.join(format!("{i}.png"));
+            image::RgbImage::from_fn(32, 24, |x, y| image::Rgb([x as u8, y as u8, 128]))
+                .save(&file)?;
+            fs::write(
+                file.with_extension("txt"),
+                if i == 0 { "" } else { "0 .5 .5 .2 .4" },
+            )?;
+            inputs.push(file);
+        }
+        let mut p = Project::new(dir.path().join("project.ylp2"), vec!["H".into()])?;
+        let cancel = AtomicBool::new(false);
+        p.import(&source, &inputs, None, &cancel, &mut |_, _| {})?;
+        let original = dir.path().join("original.zip");
+        p.export(&original, &cancel, &mut |_, _| {})?;
+        let base = fs::metadata(original)?.len();
+        let settings = Some((AugmentOptions::default(), 234));
+        let full = dir.path().join("full.zip");
+        let mut report = p.export_with_augmentation(&full, settings, &cancel, &mut |_, _| {})?;
+        assert_eq!(report["summary"]["images"], 202);
+        assert_eq!(report["summary"]["backgrounds"], 2);
+        let limited = dir.path().join("limited.zip");
+        let mut small =
+            p.export_with_limit(&limited, settings, base + 1800, &cancel, &mut |_, _| {})?;
+        let added = small["augmentation"]["added"].as_u64().unwrap();
+        assert!(added > 0 && added < 101);
+        assert_eq!(small["summary"]["images"], 101 + added);
+        assert!(fs::metadata(limited)?.len() <= base + 1800);
+        let small_again = dir.path().join("again.zip");
+        let mut again =
+            p.export_with_limit(&small_again, settings, base + 1800, &cancel, &mut |_, _| {})?;
+        small.as_object_mut().unwrap().remove("created_utc_seconds");
+        again.as_object_mut().unwrap().remove("created_utc_seconds");
+        assert_eq!(small, again);
+        for entry in report["mapping"].as_array_mut().unwrap().iter().take(101) {
+            assert!(entry.get("augmentation").is_none());
+        }
+        let rejected = dir.path().join("too-small.zip");
+        assert!(
+            p.export_with_limit(&rejected, settings, base - 1, &cancel, &mut |_, _| {})
+                .is_err()
+        );
+        assert!(!rejected.exists() && !rejected.with_extension("report.json").exists());
+        let interrupted = dir.path().join("cancelled.zip");
+        assert!(
+            p.export_with_augmentation(&interrupted, settings, &cancel, &mut |done, _| {
+                if done > MIN_IMAGES {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            })
+            .is_err()
+        );
+        assert!(!interrupted.exists() && !interrupted.with_extension("report.json").exists());
+        Ok(())
+    }
 }
